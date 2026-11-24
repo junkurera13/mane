@@ -90,6 +90,7 @@ const cfg = {
   negotiationMs: 30000,      // Lucy: socket answer
   firstFrameMs: 90000,       // any engine: first live frame (a cold fal runner can take a while)
   blockMs: 300000,           // an engine that refused us is skipped this long
+  retryDelaysMs: [1500, 4000, 8000],   // reconnects after a dropped session, before giving up
   tokenMaxAgeMs: 100000,     // fal realtime tokens live 120 s
 };
 
@@ -301,8 +302,8 @@ function fal() {
 /* --------------------------------------------------------------- session */
 let sess = null;                     // the live session (Eden or Lucy), if any
 let want = null;                     // { id, prompt } the user wants to see, or null = real hair
-let waitingForToken = null;          // a Lucy attempt waiting for its token: { retried }
-let idleTimer = null, quietTimer = null;
+let waitingForToken = null;          // a Lucy attempt waiting for its token: { attempt }
+let idleTimer = null, quietTimer = null, retryTimer = null;
 const blockedUntil = {};             // engine -> Date.now() before which it's skipped
 
 function setBusy(on) { cls("busy", on); }
@@ -323,9 +324,9 @@ function pickEngine(after) {
   return null;
 }
 
-function newSession(engine, retried, warm) {
+function newSession(engine, attempt, warm) {
   const s = {
-    engine, retried: !!retried, ended: false, live: false, frames: false,
+    engine, attempt: attempt || 0, ended: false, live: false, frames: false,
     t0: performance.now(), sentPrompt: null, timers: [],
     // Lucy
     ws: null, pc: null, hasRemote: false, pending: [],
@@ -339,20 +340,21 @@ function newSession(engine, retried, warm) {
   return s;
 }
 
-function connect(engine, retried) {
+function connect(engine, attempt) {
+  clearTimeout(retryTimer); retryTimer = null;
   engine = engine || pickEngine();
   if (!engine) {
     if (want) { tell({ type: "failed", id: want.id, reason: "no live engine available", fatal: true }); want = null; }
     setBusy(false);
     return;
   }
-  if (engine === "eden") return connectEden(retried);
-  return connectLucy(retried);
+  if (engine === "eden") return connectEden(attempt);
+  return connectLucy(attempt);
 }
 
 /* ---- Eden Live (fal WMA: HTTP signalling through the app, WebRTC media + data channel) */
-async function connectEden(retried, warm) {
-  const s = newSession("eden", retried, warm);
+async function connectEden(attempt, warm) {
+  const s = newSession("eden", attempt, warm);
   try {
     const stream = await openCamera();
     if (s.ended) return;
@@ -438,11 +440,11 @@ function wireSend(s, obj) {
   if (s.ws && s.ws.readyState === WebSocket.OPEN) s.ws.send(mp.encode(obj));
 }
 
-function connectLucy(retried) {
+function connectLucy(attempt) {
   const t = useToken();
-  if (!t) { waitingForToken = { retried: !!retried }; setBusy(true); return; }
+  if (!t) { waitingForToken = { attempt: attempt || 0 }; setBusy(true); return; }
   waitingForToken = null;
-  const s = newSession("lucy", retried);
+  const s = newSession("lucy", attempt);
   const url = "wss://fal.run/" + cfg.lucy.endpoint + "?fal_jwt_token=" + encodeURIComponent(t);
   const ws = new WebSocket(url);
   ws.binaryType = "arraybuffer";
@@ -621,17 +623,27 @@ function end(s, reason, fatal) {
     try { if (s.ws && s.ws.readyState <= 1) s.ws.close(1000); } catch (_) {}
   }
   const wasCurrent = s === sess;
+  const willRetry = wasCurrent && reason && want && !fatal && s.attempt < cfg.retryDelaysMs.length;
   if (wasCurrent) {
     sess = null;
+    // Reconnecting: hold the last live frame (with the sheen) instead of snapping back.
+    const holdFrame = willRetry && s.frames && document.body.classList.contains("ai") && window.mane.snapshot(0, 0.9, "ai");
+    if (holdFrame) window.mane.showStill(holdFrame);
     showAI(false);
-    setBusy(false);
+    setBusy(!!willRetry);
     ai.srcObject = null;
   }
   tell({ type: "session", engine: s.engine, state: "ended", reason: reason || "done", fatal: !!fatal, ms: since(s) });
   if (!wasCurrent || !reason || !want) return;
   if (fatal) blockedUntil[s.engine] = Date.now() + cfg.blockMs;
-  // One quiet retry on the same engine for a dropped connection, then the next engine.
-  if (!fatal && !s.retried) return connect(s.engine, true);
+  // A dropped connection: reconnect on the same engine a few times, then try the next engine.
+  if (willRetry) {
+    const engine = s.engine, attempt = s.attempt + 1;
+    retryTimer = setTimeout(() => { retryTimer = null; if (want && !sess) connect(engine, attempt); },
+                            cfg.retryDelaysMs[s.attempt]);
+    return;
+  }
+  cls("still", false);
   const next = pickEngine(s.engine);
   if (next) return connect(next);
   tell({ type: "failed", id: want.id, reason, fatal: !!fatal });
@@ -652,6 +664,7 @@ window.mane = {
   },
 
   close() {
+    clearTimeout(retryTimer); retryTimer = null;
     want = null;
     clearTimeout(idleTimer); clearTimeout(quietTimer);
     hangUp();
@@ -663,13 +676,14 @@ window.mane = {
 
   setToken(t) {
     token = t; tokenAt = performance.now();
-    if (waitingForToken && want) connectLucy(waitingForToken.retried);
+    if (waitingForToken && want) connectLucy(waitingForToken.attempt);
   },
 
   // prompt === null -> back to your real hair
   apply(id, prompt) {
     clearTimeout(idleTimer); clearTimeout(quietTimer);
     if (!prompt) {
+      clearTimeout(retryTimer); retryTimer = null;
       want = null;
       showAI(false);
       cls("still", false);
@@ -701,6 +715,9 @@ window.mane = {
           }, 900);
         }
       }
+    } else if (retryTimer) {
+      const pending = retryTimer; clearTimeout(pending); retryTimer = null;
+      connect();                               // reconnecting anyway: do it now, with the new cut
     } else if (!waitingForToken) {
       connect();
     }

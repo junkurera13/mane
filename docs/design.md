@@ -90,3 +90,28 @@ live haircut try-on, which is why this uses a hosted realtime model.
 - Real-device behaviour of the notch panel (hover, click-through, Spaces, full screen).
 - Lucy's actual quality on hair, and its availability on Jun's fal account.
 - Camera framing: Lucy output is cropped to a square; faces should sit centre-top.
+
+## Update (same night): live engine is now Eden Live
+
+- **Lucy on fal was unavailable all night.** Every session got "Concurrent session limit
+  reached." That is Decart's own per-account concurrency error, so fal's shared Lucy pool was full;
+  fal's official client got the same refusal, and Decart's direct sign-up was closed.
+- **Jun ruled out photos:** "I don't want photo. I want to build a mirror." The photo fallback is gone.
+- **Eden Live (VAST, `vast/eden-live-5b-video` on fal, WMA/WebRTC)** had capacity. It re-renders
+  the camera in the look of an anchor frame, at 1280×704/24 fps for $0.0035/s.
+- **Measured on GitHub's Linux runner** (real WebRTC, a moving test face):
+  - Without our anchor, Eden makes its own (FLUX.2 klein 4B), and it changed the person's identity.
+  - With a Nano Banana anchor, it stayed the same person with a convincing cut. First frame ≈5 s
+    after the session opened (one cold start took >45 s); switching cuts ≈1.6 s.
+  - The video followed the head's motion without visible flicker.
+- **Editor timings for anchors:**
+  - klein 9B: 1.2 s, identity mostly kept, spikier hair
+  - klein 4B: 1 s, identity drifts
+  - Nano Banana: 8–9 s, best
+- **Design now:**
+  - A tap warms the Eden session while Nano Banana makes the anchor (~10 s to the first cut).
+  - The other built-in cuts' anchors are then prefetched one at a time, so later taps take ~2 s.
+  - Anchors double as the circle thumbnails.
+  - Lucy remains a second engine for when its capacity returns.
+- **Testing without a Mac or a stored secret:** the live-test job publishes a one-time RSA public
+  key; the fal key is encrypted to it and committed; only that ephemeral runner can decrypt it.
