@@ -7,6 +7,13 @@ No text, no buttons: just you and a row of floating circles. **+** lets you type
 
 <p align="center"><img src="Resources/AppIcon-1024.png" width="128" alt=""></p>
 
+| Open | Choosing | Wolf cut | + |
+| --- | --- | --- | --- |
+| ![](docs/screens/open.jpg) | ![](docs/screens/making.jpg) | ![](docs/screens/wolf.jpg) | ![](docs/screens/typing.jpg) |
+
+*The real app on macOS 26, screenshotted by CI in demo mode (a test photo stands in for the
+camera, and the wolf cut is the photo-fallback result).*
+
 ## Install
 
 1. Download **Mane.dmg** from the [`mane-latest` release](https://github.com/junkurera13/jun-work/releases/tag/mane-latest).
