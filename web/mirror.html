@@ -1,0 +1,604 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Mane mirror</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body {
+    margin: 0; height: 100%; overflow: hidden;
+    background: #000;
+    -webkit-user-select: none; user-select: none;
+    cursor: default;
+  }
+  video {
+    position: absolute; inset: 0;
+    width: 100%; height: 100%;
+    object-fit: cover;
+    transform: scaleX(-1);           /* a mirror, not a camera */
+    pointer-events: none;
+  }
+  #cam { opacity: 0; transition: opacity .7s ease; }
+  body.cam-on #cam { opacity: 1; }
+
+  #ai { opacity: 0; transition: opacity .5s ease; }
+  body.ai #ai { opacity: 1; }
+  body.ai.hold #ai { opacity: 0; transition-duration: .14s; }
+
+  /* A still AI photo (fallback when the live stream can't start). Already mirrored. */
+  #still {
+    position: absolute; inset: 0; width: 100%; height: 100%;
+    object-fit: cover; pointer-events: none;
+    opacity: 0; transition: opacity .6s ease;
+  }
+  body.still #still { opacity: 1; }
+  body.still.hold #still { opacity: 0; transition-duration: .14s; }
+
+  /* The app is showing its own camera layer underneath. */
+  body.native, html.native { background: transparent; }
+  body.native #cam { display: none; }
+
+  /* A soft light sweeping across the glass while the new cut is being made. */
+  #sheen {
+    position: absolute; inset: -40%;
+    pointer-events: none; opacity: 0;
+    background: linear-gradient(105deg,
+      transparent 42%, rgba(255,255,255,.07) 48%, rgba(255,255,255,.13) 50%,
+      rgba(255,255,255,.07) 52%, transparent 58%);
+    transition: opacity .4s ease;
+  }
+  body.busy #sheen { opacity: 1; animation: sweep 1.5s cubic-bezier(.45,0,.25,1) infinite; }
+  @keyframes sweep { from { transform: translateX(-35%); } to { transform: translateX(35%); } }
+
+  /* Camera flash for a saved photo. */
+  #flash { position: absolute; inset: 0; background: #fff; opacity: 0; pointer-events: none; }
+  #flash.go { animation: flash .5s ease-out; }
+  @keyframes flash { 0% { opacity: .75; } 100% { opacity: 0; } }
+</style>
+</head>
+<body>
+<video id="cam" autoplay muted playsinline></video>
+<video id="ai" autoplay muted playsinline></video>
+<img id="still" alt="">
+<div id="sheen"></div>
+<div id="flash"></div>
+<script>
+"use strict";
+/*
+ * Mane's mirror engine.
+ *
+ * Shows the camera as a mirror. When a haircut is chosen it opens a live session with
+ * Decart's Lucy model on fal.ai (WebSocket signalling + WebRTC media), streams the camera
+ * up, and fades in the repainted video that comes back. Changing the haircut while live
+ * only sends a new prompt over the open socket, so switching is near-instant.
+ *
+ * The native app drives it through window.mane.* and hears back through
+ * window.webkit.messageHandlers.mane (see Mirror.swift).
+ */
+
+/* ------------------------------------------------------------------ config */
+const cfg = {
+  endpoint: "decart/lucy-2-6/realtime",
+  expandPrompt: false,       // our prompts are already written for Lucy
+  idleCloseMs: 12000,        // back on your real hair this long -> hang up (stop paying)
+  maxQuietMs: 180000,        // no taps for 3 min while live -> back to real, hang up
+  negotiationMs: 20000,
+  tokenMaxAgeMs: 100000,     // fal realtime tokens live 120 s
+};
+
+/* --------------------------------------------------------------- msgpack */
+// A small MessagePack codec: fal's realtime socket speaks msgpack.
+const mp = (() => {
+  const te = new TextEncoder(), td = new TextDecoder();
+  function encode(value) {
+    const out = [];
+    const u8 = (b) => out.push(b & 0xff);
+    const u16 = (n) => { u8(n >> 8); u8(n); };
+    const u32 = (n) => { u8(n >>> 24); u8(n >>> 16); u8(n >>> 8); u8(n); };
+    const bytes = (arr) => { for (let i = 0; i < arr.length; i++) out.push(arr[i]); };
+    const enc = (v) => {
+      if (v === null || v === undefined) return u8(0xc0);
+      if (v === false) return u8(0xc2);
+      if (v === true) return u8(0xc3);
+      if (typeof v === "number") {
+        if (Number.isInteger(v) && Math.abs(v) <= 0xffffffff) {
+          if (v >= 0) {
+            if (v < 0x80) return u8(v);
+            if (v < 0x100) { u8(0xcc); return u8(v); }
+            if (v < 0x10000) { u8(0xcd); return u16(v); }
+            u8(0xce); return u32(v);
+          }
+          if (v >= -32) return u8(v);
+          if (v >= -128) { u8(0xd0); return u8(v); }
+          if (v >= -32768) { u8(0xd1); return u16(v); }
+          if (v >= -2147483648) { u8(0xd2); return u32(v); }
+        }
+        const b = new Uint8Array(8); new DataView(b.buffer).setFloat64(0, v);
+        u8(0xcb); return bytes(b);
+      }
+      if (typeof v === "string") {
+        const b = te.encode(v), n = b.length;
+        if (n < 32) u8(0xa0 | n);
+        else if (n < 0x100) { u8(0xd9); u8(n); }
+        else if (n < 0x10000) { u8(0xda); u16(n); }
+        else { u8(0xdb); u32(n); }
+        return bytes(b);
+      }
+      if (v instanceof Uint8Array) {
+        const n = v.length;
+        if (n < 0x100) { u8(0xc4); u8(n); } else if (n < 0x10000) { u8(0xc5); u16(n); } else { u8(0xc6); u32(n); }
+        return bytes(v);
+      }
+      if (Array.isArray(v)) {
+        const n = v.length;
+        if (n < 16) u8(0x90 | n); else if (n < 0x10000) { u8(0xdc); u16(n); } else { u8(0xdd); u32(n); }
+        return v.forEach(enc);
+      }
+      if (typeof v === "object") {
+        const keys = Object.keys(v).filter((k) => v[k] !== undefined), n = keys.length;
+        if (n < 16) u8(0x80 | n); else if (n < 0x10000) { u8(0xde); u16(n); } else { u8(0xdf); u32(n); }
+        return keys.forEach((k) => { enc(k); enc(v[k]); });
+      }
+      throw new Error("msgpack: cannot encode " + typeof v);
+    };
+    enc(value);
+    return new Uint8Array(out);
+  }
+  function decode(buf) {
+    const b = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+    const dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
+    let p = 0;
+    const str = (n) => { const s = td.decode(b.subarray(p, p + n)); p += n; return s; };
+    const bin = (n) => { const s = b.slice(p, p + n); p += n; return s; };
+    const arr = (n) => { const a = new Array(n); for (let i = 0; i < n; i++) a[i] = dec(); return a; };
+    const map = (n) => { const o = {}; for (let i = 0; i < n; i++) { const k = dec(); o[k] = dec(); } return o; };
+    const ext = (n) => { p += 1 + n; return null; };
+    const dec = () => {
+      const t = b[p++];
+      if (t < 0x80) return t;
+      if (t < 0x90) return map(t & 0x0f);
+      if (t < 0xa0) return arr(t & 0x0f);
+      if (t < 0xc0) return str(t & 0x1f);
+      if (t >= 0xe0) return t - 0x100;
+      let v;
+      switch (t) {
+        case 0xc0: return null;
+        case 0xc2: return false;
+        case 0xc3: return true;
+        case 0xc4: v = dv.getUint8(p); p += 1; return bin(v);
+        case 0xc5: v = dv.getUint16(p); p += 2; return bin(v);
+        case 0xc6: v = dv.getUint32(p); p += 4; return bin(v);
+        case 0xc7: v = dv.getUint8(p); p += 1; return ext(v);
+        case 0xc8: v = dv.getUint16(p); p += 2; return ext(v);
+        case 0xc9: v = dv.getUint32(p); p += 4; return ext(v);
+        case 0xca: v = dv.getFloat32(p); p += 4; return v;
+        case 0xcb: v = dv.getFloat64(p); p += 8; return v;
+        case 0xcc: v = dv.getUint8(p); p += 1; return v;
+        case 0xcd: v = dv.getUint16(p); p += 2; return v;
+        case 0xce: v = dv.getUint32(p); p += 4; return v;
+        case 0xcf: v = Number(dv.getBigUint64(p)); p += 8; return v;
+        case 0xd0: v = dv.getInt8(p); p += 1; return v;
+        case 0xd1: v = dv.getInt16(p); p += 2; return v;
+        case 0xd2: v = dv.getInt32(p); p += 4; return v;
+        case 0xd3: v = Number(dv.getBigInt64(p)); p += 8; return v;
+        case 0xd4: return ext(1);
+        case 0xd5: return ext(2);
+        case 0xd6: return ext(4);
+        case 0xd7: return ext(8);
+        case 0xd8: return ext(16);
+        case 0xd9: v = dv.getUint8(p); p += 1; return str(v);
+        case 0xda: v = dv.getUint16(p); p += 2; return str(v);
+        case 0xdb: v = dv.getUint32(p); p += 4; return str(v);
+        case 0xdc: v = dv.getUint16(p); p += 2; return arr(v);
+        case 0xdd: v = dv.getUint32(p); p += 4; return arr(v);
+        case 0xde: v = dv.getUint16(p); p += 2; return map(v);
+        case 0xdf: v = dv.getUint32(p); p += 4; return map(v);
+      }
+      throw new Error("msgpack: bad byte 0x" + t.toString(16));
+    };
+    return dec();
+  }
+  return { encode, decode };
+})();
+
+/* ---------------------------------------------------------------- bridge */
+const log = [];
+function tell(msg) {
+  try { window.webkit.messageHandlers.mane.postMessage(msg); }
+  catch (_) { /* running outside the app (tests / a browser) */ }
+  log.push(Object.assign({ t: Math.round(performance.now()) }, msg));
+  if (log.length > 400) log.shift();
+}
+const $ = (id) => document.getElementById(id);
+const cam = $("cam"), ai = $("ai");
+const cls = (name, on) => document.body.classList.toggle(name, !!on);
+
+/* ---------------------------------------------------------------- camera */
+let camStream = null;
+let camOpening = null;
+
+async function openCamera() {
+  if (camStream) return camStream;
+  if (camOpening) return camOpening;
+  camOpening = (async () => {
+    try {
+      const s = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 }, facingMode: "user" },
+      });
+      camStream = s;
+      cam.srcObject = s;
+      await cam.play().catch(() => {});
+      const track = s.getVideoTracks()[0];
+      const st = track && track.getSettings ? track.getSettings() : {};
+      tell({ type: "camera", on: true, width: st.width, height: st.height });
+      requestAnimationFrame(() => cls("cam-on", true));
+      return s;
+    } catch (e) {
+      tell({ type: "camera", on: false, error: String(e && e.name || e) });
+      throw e;
+    } finally {
+      camOpening = null;
+    }
+  })();
+  return camOpening;
+}
+
+function closeCamera() {
+  cls("cam-on", false);
+  if (camStream) camStream.getTracks().forEach((t) => t.stop());
+  camStream = null;
+  cam.srcObject = null;
+}
+
+/* ----------------------------------------------------------------- token */
+let token = null, tokenAt = 0;
+function freshToken() {
+  if (token && performance.now() - tokenAt < cfg.tokenMaxAgeMs) return token;
+  token = null;
+  return null;
+}
+function useToken() {
+  const t = freshToken();
+  token = null;                      // one connection per token
+  tell({ type: "needToken" });       // ask for the next one now so it's ready
+  return t;
+}
+
+/* --------------------------------------------------------------- session */
+let sess = null;                     // the live Lucy session, if any
+let want = null;                     // { id, prompt } the user wants to see, or null = real hair
+let waitingForToken = false;
+let idleTimer = null, quietTimer = null;
+let retried = false;
+
+function setBusy(on) { cls("busy", on); }
+
+function showAI(on) {
+  cls("ai", on);
+  if (on) cls("still", false);
+}
+
+function wireSend(s, obj) {
+  if (s.ws && s.ws.readyState === WebSocket.OPEN) s.ws.send(mp.encode(obj));
+}
+
+function connect() {
+  const t = useToken();
+  if (!t) { waitingForToken = true; setBusy(true); return; }
+  waitingForToken = false;
+  const s = {
+    ws: null, pc: null, live: false, ended: false,
+    hasRemote: false, pending: [], iceTimer: null, negTimer: null,
+    sentPrompt: null, t0: performance.now(), frames: false,
+  };
+  sess = s;
+  setBusy(true);
+  tell({ type: "session", state: "connecting" });
+
+  const url = "wss://fal.run/" + cfg.endpoint + "?fal_jwt_token=" + encodeURIComponent(t);
+  const ws = new WebSocket(url);
+  ws.binaryType = "arraybuffer";
+  s.ws = ws;
+  ws.onopen = () => {
+    const first = { prompt: want ? want.prompt : "", enable_prompt_expansion: cfg.expandPrompt };
+    s.sentPrompt = first.prompt;
+    wireSend(s, first);
+    tell({ type: "session", state: "socket-open", ms: Math.round(performance.now() - s.t0) });
+  };
+  ws.onmessage = (ev) => {
+    let m;
+    try { m = typeof ev.data === "string" ? JSON.parse(ev.data) : mp.decode(ev.data); }
+    catch (e) { return tell({ type: "warn", what: "decode", error: String(e) }); }
+    onSignal(s, m).catch((e) => end(s, "signal: " + (e && e.message || e)));
+  };
+  ws.onerror = () => end(s, "socket error");
+  ws.onclose = (ev) => { if (!s.ended) end(s, "socket closed " + ev.code + (ev.reason ? " " + ev.reason : "")); };
+  s.negTimer = setTimeout(() => { if (!s.hasRemote) end(s, "no answer in time"); }, cfg.negotiationMs);
+}
+
+async function onSignal(s, m) {
+  if (s.ended || !m || typeof m !== "object") return;
+  const type = String(m.type || "").toLowerCase();
+  if (type !== "icecandidate") tell({ type: "signal", kind: type || m.status || "?", ms: Math.round(performance.now() - s.t0), detail: brief(m) });
+
+  if (m.status === "error" || type === "x-fal-error") {
+    if (m.error === "TIMEOUT") return;
+    const why = (m.error || "error") + (m.reason ? ": " + m.reason : "");
+    return end(s, why, isFatal(why));
+  }
+  if (type === "x-fal-message") return;
+
+  switch (type) {
+    case "ready": {
+      const ice = m.iceServers || m.ice_servers || m.iceservers;
+      if (ice) await startPeer(s, ice);
+      else s.iceTimer = setTimeout(() => startPeer(s, null).catch((e) => end(s, String(e))), 1000);
+      break;
+    }
+    case "iceservers": {
+      if (!s.pc) await startPeer(s, m.iceServers || m.ice_servers || m.iceservers);
+      break;
+    }
+    case "answer": {
+      if (!s.pc || !m.sdp || s.hasRemote) return;
+      s.hasRemote = true;
+      await s.pc.setRemoteDescription({ type: "answer", sdp: m.sdp });
+      for (const c of s.pending.splice(0)) await s.pc.addIceCandidate(c).catch(() => {});
+      clearTimeout(s.negTimer);
+      s.live = true;
+      tell({ type: "session", state: "negotiated", ms: Math.round(performance.now() - s.t0) });
+      syncPrompt();
+      break;
+    }
+    case "icecandidate": {
+      if (!m.candidate) return;
+      if (!s.pc || !s.hasRemote) s.pending.push(m.candidate);
+      else await s.pc.addIceCandidate(m.candidate).catch(() => {});
+      break;
+    }
+    case "error": {
+      const why = m.error || m.message || m.reason || "model error";
+      end(s, why, isFatal(why));
+      break;
+    }
+  }
+}
+
+// Errors a retry can't fix: send the app straight to its fallback.
+function isFatal(why) {
+  return /limit|unauthori[sz]ed|forbidden|balance|locked|not found|quota|credit/i.test(String(why));
+}
+
+function brief(m) {
+  const o = {};
+  for (const k of Object.keys(m)) {
+    const v = m[k];
+    if (k === "sdp") o[k] = "(" + String(v).length + " chars)";
+    else if (typeof v === "string" && v.length > 200) o[k] = v.slice(0, 200) + "…";
+    else o[k] = v;
+  }
+  return o;
+}
+
+async function startPeer(s, iceServers) {
+  if (s.pc || s.ended) return;
+  clearTimeout(s.iceTimer);
+  const stream = await openCamera();
+  if (s.ended) return;
+  const pc = new RTCPeerConnection({
+    iceServers: (iceServers && iceServers.length) ? iceServers : [{ urls: "stun:stun.l.google.com:19302" }],
+  });
+  s.pc = pc;
+  for (const track of stream.getVideoTracks()) pc.addTrack(track, stream);
+  pc.ontrack = (ev) => {
+    if (s.ended) return;
+    const rs = ev.streams && ev.streams[0] ? ev.streams[0] : new MediaStream([ev.track]);
+    ai.srcObject = rs;
+    ai.play().catch(() => {});
+    watchFrames(s);
+  };
+  pc.onicecandidate = (ev) => {
+    if (!ev.candidate) return;
+    wireSend(s, {
+      type: "icecandidate",
+      candidate: { candidate: ev.candidate.candidate, sdpMid: ev.candidate.sdpMid, sdpMLineIndex: ev.candidate.sdpMLineIndex },
+    });
+  };
+  pc.onconnectionstatechange = () => {
+    tell({ type: "session", state: "peer-" + pc.connectionState, ms: Math.round(performance.now() - s.t0) });
+    if (pc.connectionState === "failed") end(s, "peer connection failed");
+  };
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  wireSend(s, { type: "offer", sdp: offer.sdp });
+}
+
+function watchFrames(s) {
+  const onFrame = () => {
+    if (s.ended || s !== sess) return;
+    if (!s.frames) {
+      s.frames = true;
+      tell({ type: "session", state: "frames", ms: Math.round(performance.now() - s.t0), width: ai.videoWidth, height: ai.videoHeight });
+    }
+    // Give Lucy a beat to apply the cut before revealing it.
+    setTimeout(() => {
+      if (s.ended || s !== sess) return;
+      setBusy(false);
+      showAI(!!want);
+      retried = false;
+    }, 350);
+  };
+  if (ai.requestVideoFrameCallback) ai.requestVideoFrameCallback(() => onFrame());
+  else ai.addEventListener("playing", onFrame, { once: true });
+}
+
+function syncPrompt() {
+  const s = sess;
+  if (!s || !s.live || !want) return;
+  if (s.sentPrompt === want.prompt) return;
+  s.sentPrompt = want.prompt;
+  wireSend(s, { prompt: want.prompt });
+  tell({ type: "session", state: "prompt", id: want.id });
+}
+
+function end(s, reason, fatal) {
+  if (!s || s.ended) return;
+  s.ended = true;
+  clearTimeout(s.negTimer); clearTimeout(s.iceTimer);
+  try { s.pc && s.pc.close(); } catch (_) {}
+  try { if (s.ws && s.ws.readyState <= 1) s.ws.close(1000); } catch (_) {}
+  const wasCurrent = s === sess;
+  if (wasCurrent) {
+    sess = null;
+    showAI(false);
+    setBusy(false);
+    ai.srcObject = null;
+  }
+  tell({ type: "session", state: "ended", reason: reason || "done", ms: Math.round(performance.now() - s.t0) });
+  if (!wasCurrent || !reason) return;
+  // One quiet retry for a dropped connection; otherwise give up and go back to real hair.
+  if (want && !fatal && !retried) {
+    retried = true;
+    return connect();
+  }
+  retried = false;
+  if (want) { tell({ type: "failed", id: want.id, reason, fatal: !!fatal }); want = null; }
+}
+
+function hangUp() {
+  if (sess) end(sess, null);
+}
+
+/* ----------------------------------------------------------- public API */
+window.mane = {
+  config(patch) { Object.assign(cfg, patch || {}); return cfg; },
+
+  async open() {
+    await openCamera();
+    if (!freshToken()) tell({ type: "needToken" });
+  },
+
+  close() {
+    want = null;
+    clearTimeout(idleTimer); clearTimeout(quietTimer);
+    hangUp();
+    closeCamera();
+    showAI(false);
+    cls("still", false);
+    setBusy(false);
+  },
+
+  setToken(t) {
+    token = t; tokenAt = performance.now();
+    if (waitingForToken && want) connect();
+  },
+
+  // prompt === null -> back to your real hair
+  apply(id, prompt) {
+    clearTimeout(idleTimer); clearTimeout(quietTimer);
+    if (!prompt) {
+      want = null;
+      showAI(false);
+      cls("still", false);
+      setBusy(false);
+      waitingForToken = false;
+      idleTimer = setTimeout(hangUp, cfg.idleCloseMs);
+      return;
+    }
+    want = { id, prompt };
+    quietTimer = setTimeout(() => {
+      tell({ type: "timeout", id: want && want.id });
+      window.mane.apply(null, null);
+    }, cfg.maxQuietMs);
+    retried = false;
+    if (sess && sess.live) {
+      syncPrompt();
+      if (sess.frames) showAI(true);
+    } else if (!sess) {
+      connect();
+    }
+    // (connecting: the latest want is sent as soon as the session is negotiated)
+  },
+
+  hold(on) { cls("hold", on); },
+
+  // Photo fallback, driven by the app.
+  busy(on) { setBusy(on); },
+  showStill(url) {
+    const img = $("still");
+    const reveal = () => { cls("still", true); cls("ai", false); };
+    if (img.src === url && img.complete) return reveal();
+    img.onload = reveal;
+    img.src = url;
+  },
+  hideStill() { cls("still", false); },
+
+  // The app's own camera layer is underneath (WebKit couldn't open the camera).
+  nativeCamera(on) {
+    cls("native", on);
+    document.documentElement.classList.toggle("native", !!on);
+  },
+
+  // Called when the app couldn't get a session token.
+  tokenFailed(reason) {
+    if (!waitingForToken) return;
+    waitingForToken = false;
+    setBusy(false);
+    if (want) { tell({ type: "failed", id: want.id, reason: reason || "token", fatal: true }); want = null; }
+  },
+
+  // Screenshots / demos without a camera: show a picture as if it were the camera.
+  demo(url) {
+    const img = $("still");
+    img.onload = () => cls("still", true);
+    img.src = url;
+  },
+
+  // A square still, as seen in the mirror. size = edge in px (0 = full res).
+  // source: "cam" (your real hair), "ai" (the live AI video) or "screen" (whatever is showing).
+  snapshot(size, quality, source) {
+    const body = document.body.classList, img = $("still");
+    let el = cam, mirrored = true;
+    if (source === "ai" || (source === "screen" && body.contains("ai"))) el = ai;
+    else if (source === "screen" && body.contains("still") && img.naturalWidth) { el = img; mirrored = false; }
+    const w = el.videoWidth || el.naturalWidth, h = el.videoHeight || el.naturalHeight;
+    if (!w || !h) return null;
+    const side = Math.min(w, h);
+    const out = size || side;
+    const c = document.createElement("canvas");
+    c.width = c.height = out;
+    const g = c.getContext("2d");
+    if (mirrored) { g.translate(out, 0); g.scale(-1, 1); }
+    g.drawImage(el, (w - side) / 2, (h - side) / 2, side, side, 0, 0, out, out);
+    return c.toDataURL("image/jpeg", quality || 0.9);
+  },
+
+  flash() {
+    const f = $("flash");
+    f.classList.remove("go"); void f.offsetWidth; f.classList.add("go");
+  },
+
+  state() {
+    return {
+      camera: !!camStream, want, live: !!(sess && sess.live), frames: !!(sess && sess.frames),
+      showingAI: document.body.classList.contains("ai"), busy: document.body.classList.contains("busy"),
+      showingStill: document.body.classList.contains("still"),
+    };
+  },
+
+  log() { return log.slice(); },
+};
+
+// Press and hold anywhere on the mirror to peek at your real hair.
+addEventListener("pointerdown", () => window.mane.hold(true));
+addEventListener("pointerup", () => window.mane.hold(false));
+addEventListener("pointercancel", () => window.mane.hold(false));
+addEventListener("blur", () => window.mane.hold(false));
+addEventListener("contextmenu", (e) => e.preventDefault());
+
+tell({ type: "loaded" });
+</script>
+</body>
+</html>
