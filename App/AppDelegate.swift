@@ -51,6 +51,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if args.contains("--demo-typing") {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { notch.model.typing = true }
             }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 5.0) { engine.dumpState() }
             return
         }
 

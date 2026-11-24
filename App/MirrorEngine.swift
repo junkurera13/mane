@@ -24,7 +24,7 @@ final class MirrorEngine: NSObject, ObservableObject {
     let container = MirrorContainerView()
 
     private var loaded = false
-    private var queued: [String] = []
+    private var queued: [(String, String)] = []
     private var minting = false
     private var liveBlockedUntil: Date?
     private var stills: [String: String] = [:]           // photo results for this opening
@@ -294,8 +294,15 @@ final class MirrorEngine: NSObject, ObservableObject {
     private func call(_ fn: String, _ args: Any...) {
         let json = (try? JSONSerialization.data(withJSONObject: args, options: [.fragmentsAllowed]))
             .flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
-        let code = "window.mane && mane.\(fn).apply(null, \(json));"
-        if loaded { webView.evaluateJavaScript(code, completionHandler: nil) } else { queued.append(code) }
+        let code = "window.mane && mane.\(fn).apply(null, \(json)); undefined;"
+        if loaded { run(code, fn) } else { queued.append((code, fn)) }
+    }
+
+    private func run(_ code: String, _ fn: String) {
+        if Self.debug { NSLog("Mane → js \(fn) (\(code.count) chars)") }
+        webView.evaluateJavaScript(code) { _, error in
+            if let error { NSLog("Mane: js \(fn) failed: \(error)") }
+        }
     }
 
     private func pageLoaded() {
@@ -303,14 +310,25 @@ final class MirrorEngine: NSObject, ObservableObject {
         loaded = true
         let pending = queued
         queued.removeAll()
-        for code in pending { webView.evaluateJavaScript(code, completionHandler: nil) }
+        for (code, fn) in pending { run(code, fn) }
+    }
+
+    static let debug = ProcessInfo.processInfo.environment["MANE_DEBUG"] != nil
+        || CommandLine.arguments.contains("--demo")
+
+    /// Demo mode: print what the page is showing (for CI logs).
+    func dumpState() {
+        webView.evaluateJavaScript(
+            "JSON.stringify(Object.assign(mane.state(), {stillSrc: document.getElementById('still').src.length, " +
+            "body: document.body.className, log: mane.log().map(x => x.type).join(',')}))"
+        ) { result, error in
+            NSLog("Mane state: \(result ?? "nil") \(error.map { "\($0)" } ?? "")")
+        }
     }
 
     fileprivate func receive(_ body: Any) {
         guard let m = body as? [String: Any], let type = m["type"] as? String else { return }
-        #if DEBUG
-        NSLog("Mane js: \(m)")
-        #endif
+        if Self.debug { NSLog("Mane ← js \(m.filter { $0.key != "detail" })") }
         switch type {
         case "loaded":
             pageLoaded()
