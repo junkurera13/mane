@@ -23,13 +23,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         HotKey.register { [weak notch] in notch?.toggle() }
 
-        // `Mane --demo <image>`: open the mirror on a picture instead of the camera.
-        if let i = args.firstIndex(of: "--demo"), i + 1 < args.count,
-           let image = NSImage(contentsOfFile: args[i + 1]) {
+        func arg(_ name: String) -> String? {
+            guard let i = args.firstIndex(of: name), i + 1 < args.count else { return nil }
+            return args[i + 1]
+        }
+
+        // `Mane --probe`: print what WebKit offers (camera, WebRTC, sockets) and quit.
+        if args.contains("--probe") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { notch.open() }
+            engine.probe { result in
+                print("PROBE " + result)
+                fflush(stdout)
+                NSApp.terminate(nil)
+            }
+            return
+        }
+
+        // `Mane --demo <image> [--demo-style id [--demo-still img]] [--demo-typing]`:
+        // open the mirror on a picture instead of the camera (for screenshots).
+        if let path = arg("--demo"), let image = NSImage(contentsOfFile: path) {
             engine.demoImage = image
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { notch.open() }
-            if let j = args.firstIndex(of: "--demo-style"), j + 1 < args.count {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { engine.demoSelect(args[j + 1]) }
+            if let id = arg("--demo-style") {
+                let still = arg("--demo-still").flatMap { NSImage(contentsOfFile: $0) }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { engine.demoSelect(id, still: still) }
+            }
+            if args.contains("--demo-typing") {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { notch.model.typing = true }
             }
             return
         }

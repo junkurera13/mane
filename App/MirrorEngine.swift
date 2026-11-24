@@ -148,9 +148,60 @@ final class MirrorEngine: NSObject, ObservableObject {
         toggle(style)
     }
 
-    func demoSelect(_ id: String) {
+    /// Demo/screenshot mode: pretend a cut was chosen (optionally showing a finished photo).
+    func demoSelect(_ id: String, still: NSImage?) {
         guard let style = allStyles.first(where: { $0.id == id }) else { return }
         active = style.id
+        if let still {
+            busy = false
+            call("showStill", Self.dataURL(still))
+        } else {
+            busy = true
+        }
+    }
+
+    /// `--probe`: report what this Mac's WebKit offers the mirror (camera, WebRTC, sockets).
+    func probe(_ done: @escaping (String) -> Void) {
+        let script = """
+        const out = { secure: isSecureContext, mediaDevices: !!navigator.mediaDevices,
+                      getUserMedia: !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia),
+                      rtc: typeof RTCPeerConnection, ws: typeof WebSocket, ua: navigator.userAgent };
+        const race = (p, ms) => Promise.race([p, new Promise((r) => setTimeout(() => r("timeout"), ms))]);
+        try {
+          const pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
+          pc.addTransceiver("video");
+          const o = await pc.createOffer();
+          out.offer = o.sdp.length; out.h264 = /H264/.test(o.sdp); out.vp8 = /VP8/.test(o.sdp);
+          pc.close();
+        } catch (e) { out.rtcError = String(e); }
+        try {
+          out.devices = (await race(navigator.mediaDevices.enumerateDevices(), 4000));
+          if (Array.isArray(out.devices)) out.devices = out.devices.map((d) => d.kind);
+        } catch (e) { out.devices = String(e); }
+        try {
+          out.camera = await race(navigator.mediaDevices.getUserMedia({ video: true }).then((s) => {
+            s.getTracks().forEach((t) => t.stop()); return "ok"; }), 6000);
+        } catch (e) { out.camera = e.name + ": " + e.message; }
+        try {
+          out.socket = await race(new Promise((r) => {
+            const ws = new WebSocket("wss://fal.run/decart/lucy-2-6/realtime?fal_jwt_token=probe");
+            ws.binaryType = "arraybuffer";
+            ws.onopen = () => { r("open"); ws.close(); };
+            ws.onerror = () => r("error");
+            ws.onclose = (e) => r("closed " + e.code);
+          }), 8000);
+        } catch (e) { out.socket = String(e); }
+        return JSON.stringify(out);
+        """
+        Task {
+            for _ in 0..<50 where !self.loaded { try? await Task.sleep(nanoseconds: 100_000_000) }
+            do {
+                let r = try await self.webView.callAsyncJavaScript(script, arguments: [:], in: nil, contentWorld: .page)
+                done(r as? String ?? "\(String(describing: r))")
+            } catch {
+                done("probe failed: \(error)")
+            }
+        }
     }
 
     private var useLive: Bool {

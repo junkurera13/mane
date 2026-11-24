@@ -17,7 +17,16 @@ cp "$BIN" "$APP/Contents/MacOS/Mane"
 sed -e "s/__VERSION__/$VERSION/" -e "s/__BUILD__/$BUILD/" Resources/Info.plist > "$APP/Contents/Info.plist"
 cp web/mirror.html "$APP/Contents/Resources/web/"
 [ -d Resources/styles ] && cp -R Resources/styles "$APP/Contents/Resources/styles"
-[ -f Resources/AppIcon.icns ] && cp Resources/AppIcon.icns "$APP/Contents/Resources/"
+if [ -f Resources/AppIcon-1024.png ]; then
+  ICONSET="build/AppIcon.iconset"
+  mkdir -p "$ICONSET"
+  for s in 16 32 128 256 512; do
+    sips -z $s $s Resources/AppIcon-1024.png --out "$ICONSET/icon_${s}x${s}.png" >/dev/null
+    sips -z $((s * 2)) $((s * 2)) Resources/AppIcon-1024.png --out "$ICONSET/icon_${s}x${s}@2x.png" >/dev/null
+  done
+  iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
+  rm -rf "$ICONSET"
+fi
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 
 # Ad hoc signature: enough for macOS to run it after a right-click → Open the first time.

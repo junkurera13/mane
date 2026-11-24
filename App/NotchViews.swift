@@ -207,7 +207,7 @@ struct StyleCircle: View {
         }
         .frame(width: diameter, height: diameter)
         .clipShape(Circle())
-        .glassCircle()
+        .glassCircle(dim: thumb == nil && style.icon == nil ? 0.38 : 0)
         .overlay(
             Circle().strokeBorder(.white.opacity(isActive ? 0.95 : 0.22), lineWidth: isActive ? 2 : 0.75)
         )
@@ -231,7 +231,7 @@ struct PlusCircle: View {
             .font(.system(size: diameter * 0.38, weight: .light))
             .foregroundStyle(.white)
             .frame(width: diameter, height: diameter)
-            .glassCircle()
+            .glassCircle(dim: 0.38)
             .overlay(Circle().strokeBorder(.white.opacity(0.22), lineWidth: 0.75))
             .shadow(color: .black.opacity(0.35), radius: 8, y: 3)
             .contentShape(Circle())
@@ -258,7 +258,7 @@ struct TypingBar: View {
         }
         .padding(.horizontal, 18)
         .frame(width: width, height: 46)
-        .glassCapsule()
+        .glassCapsule(dim: 0.38)
         .overlay(Capsule().strokeBorder(.white.opacity(0.22), lineWidth: 0.75))
         .shadow(color: .black.opacity(0.35), radius: 10, y: 3)
         .onAppear { DispatchQueue.main.async { focused = true } }
@@ -288,27 +288,28 @@ struct Shake: GeometryEffect {
 
 extension View {
     /// Liquid Glass on macOS 26+, frosted material before that.
-    @ViewBuilder func glassCircle() -> some View {
+    /// `dim` darkens the glass so white symbols stay readable over bright backgrounds.
+    @ViewBuilder func glassCircle(dim: Double = 0) -> some View {
         #if compiler(>=6.2)
         if #available(macOS 26.0, *) {
-            self.glassEffect(.regular, in: Circle())
+            self.glassEffect(dim > 0 ? .regular.tint(.black.opacity(dim)) : .regular, in: Circle())
         } else {
-            self.background(.ultraThinMaterial, in: Circle())
+            self.background(Circle().fill(.black.opacity(dim))).background(.ultraThinMaterial, in: Circle())
         }
         #else
-        self.background(.ultraThinMaterial, in: Circle())
+        self.background(Circle().fill(.black.opacity(dim))).background(.ultraThinMaterial, in: Circle())
         #endif
     }
 
-    @ViewBuilder func glassCapsule() -> some View {
+    @ViewBuilder func glassCapsule(dim: Double = 0) -> some View {
         #if compiler(>=6.2)
         if #available(macOS 26.0, *) {
-            self.glassEffect(.regular, in: Capsule())
+            self.glassEffect(dim > 0 ? .regular.tint(.black.opacity(dim)) : .regular, in: Capsule())
         } else {
-            self.background(.ultraThinMaterial, in: Capsule())
+            self.background(Capsule().fill(.black.opacity(dim))).background(.ultraThinMaterial, in: Capsule())
         }
         #else
-        self.background(.ultraThinMaterial, in: Capsule())
+        self.background(Capsule().fill(.black.opacity(dim))).background(.ultraThinMaterial, in: Capsule())
         #endif
     }
 }
