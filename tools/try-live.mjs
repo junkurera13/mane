@@ -29,6 +29,12 @@ const seconds = Number(opt("seconds", "6"));
 const engines = opt("engines", "eden,lucy").split(",");
 const edenEndpoint = opt("eden-endpoint", "vast/eden-live-5b-video");
 const record = args.includes("--record");
+// --app-flow: do what the app does. Each --style is "id=look"; anchors are made with Nano Banana
+// from the live camera frame; the first cut waits for its anchor, later cuts use cached ones.
+const appFlow = args.includes("--app-flow");
+const edenPrompt = (look) => `A photorealistic live video of the same person with ${look}. Same face, identity, expression, skin, clothing, lighting and background as the camera.`;
+const livePrompt = (look) => `Change the person's hair to ${look}. Keep the same face, identity, expression, clothing and background.`;
+const anchorPrompt = (look) => `Edit only the hair: give this person ${look}. Keep exactly the same face, identity, expression, skin, lighting, clothing, background, camera angle and framing. Photorealistic photo.`;
 const expand = opt("expand", "false") === "true";
 const extraArgs = (opt("chrome-args", "") || "").split(" ").filter(Boolean);
 const key = process.env.FAL_KEY;
@@ -99,8 +105,53 @@ const waitFor = async (pred, ms) => {
   return false;
 };
 
+async function makeAnchor(look) {
+  const frame = await page.evaluate(() => window.mane.frame(896, 0.85));
+  const body = JSON.stringify({ prompt: anchorPrompt(look), image_urls: [frame], num_images: 1, output_format: "jpeg", aspect_ratio: "16:9" });
+  const res = JSON.parse(execFileSync("curl", ["-sS", "-m", "90", "-X", "POST", "https://fal.run/fal-ai/nano-banana/edit",
+    "-H", "Authorization: Key " + key, "-H", "Content-Type: application/json", "--data-binary", "@-"], { input: body }).toString());
+  const img = execFileSync("curl", ["-sS", "-m", "60", res.images[0].url]);
+  const src = "data:image/jpeg;base64," + img.toString("base64");
+  return page.evaluate(async (src) => {
+    const im = new Image(); im.src = src; await im.decode();
+    const w = 640, h = Math.round(im.naturalHeight * w / im.naturalWidth);
+    const c = document.createElement("canvas"); c.width = w; c.height = h;
+    c.getContext("2d").drawImage(im, 0, 0, w, h);
+    return c.toDataURL("image/jpeg", 0.7);
+  }, src);
+}
+
 let n = 1;
-for (const s of styles) {
+if (appFlow) {
+  const cache = {};
+  for (const [i, s] of styles.entries()) {
+    const look = s.prompt;
+    console.log(`style ${s.id}: ${look}`);
+    const t0 = Date.now();
+    if (!cache[s.id]) {
+      if (i === 0) await page.evaluate(() => window.mane.warm());
+      cache[s.id] = await makeAnchor(look);
+      console.log(`  anchor ${s.id}: ${Date.now() - t0} ms, ${cache[s.id].length} chars`);
+      writeFileSync(join(out, `anchor-${s.id}.jpg`), Buffer.from(cache[s.id].split(",")[1], "base64"));
+    }
+    const t1 = Date.now();
+    await page.evaluate(({ id, p }) => window.mane.apply(id, p), { id: s.id, p: { eden: edenPrompt(look), lucy: livePrompt(look), anchor: cache[s.id] } });
+    const ok = await waitFor(() => window.mane.state().showingAI && !window.mane.state().busy, 100000);
+    console.log(`  showing AI: ${ok} after ${Date.now() - t1} ms from apply (${Date.now() - t0} ms from tap)`);
+    // Like the app: after the first cut, make the next ones' anchors while this one plays.
+    if (i === 0) for (const nx of styles.slice(1)) {
+      const ta = Date.now(); cache[nx.id] = await makeAnchor(nx.prompt);
+      console.log(`  prefetched anchor ${nx.id}: ${Date.now() - ta} ms`);
+      writeFileSync(join(out, `anchor-${nx.id}.jpg`), Buffer.from(cache[nx.id].split(",")[1], "base64"));
+    }
+    for (let k = 1; k <= 3; k++) {
+      await page.waitForTimeout((seconds * 1000) / 3);
+      await page.screenshot({ path: join(out, `${String(n).padStart(2, "0")}-${s.id}-${k}.png`) });
+    }
+    n++;
+  }
+}
+for (const s of appFlow ? [] : styles) {
   console.log(`style ${s.id}: ${s.prompt}`);
   const t0 = Date.now();
   const anchor = anchors[s.id] ? "data:image/jpeg;base64," + readFileSync(anchors[s.id]).toString("base64") : undefined;

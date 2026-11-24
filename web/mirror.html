@@ -88,7 +88,7 @@ const cfg = {
   idleCloseMs: 12000,        // back on your real hair this long -> hang up (stop paying)
   maxQuietMs: 180000,        // no taps for 3 min while live -> back to real, hang up
   negotiationMs: 30000,      // Lucy: socket answer
-  firstFrameMs: 45000,       // any engine: first live frame
+  firstFrameMs: 90000,       // any engine: first live frame (a cold fal runner can take a while)
   blockMs: 300000,           // an engine that refused us is skipped this long
   tokenMaxAgeMs: 100000,     // fal realtime tokens live 120 s
 };
@@ -323,19 +323,19 @@ function pickEngine(after) {
   return null;
 }
 
-function newSession(engine, retried) {
+function newSession(engine, retried, warm) {
   const s = {
     engine, retried: !!retried, ended: false, live: false, frames: false,
     t0: performance.now(), sentPrompt: null, timers: [],
     // Lucy
     ws: null, pc: null, hasRemote: false, pending: [],
     // Eden
-    handle: null, configured: false, lastError: null,
+    handle: null, configured: false, configureSent: false, lastError: null,
   };
   sess = s;
-  setBusy(true);
-  tell({ type: "session", engine, state: "connecting" });
-  s.timers.push(setTimeout(() => { if (!s.frames) end(s, "no live video in time", true); }, cfg.firstFrameMs));
+  setBusy(!warm);
+  tell({ type: "session", engine, state: warm ? "warming" : "connecting" });
+  if (!warm) startFrameClock(s);
   return s;
 }
 
@@ -351,8 +351,8 @@ function connect(engine, retried) {
 }
 
 /* ---- Eden Live (fal WMA: HTTP signalling through the app, WebRTC media + data channel) */
-async function connectEden(retried) {
-  const s = newSession("eden", retried);
+async function connectEden(retried, warm) {
+  const s = newSession("eden", retried, warm);
   try {
     const stream = await openCamera();
     if (s.ended) return;
@@ -379,14 +379,31 @@ async function connectEden(retried) {
       },
     });
     s.handle = handle;
-    s.sentPrompt = promptFor("eden");
-    const anchor = want && want.prompts.anchor;    // optional: a frame of you already wearing the cut
-    handle.send({ type: "configure", prompt: s.sentPrompt, enable_prompt_expansion: cfg.expandPrompt,
-                  ...(anchor ? { image_url: anchor } : {}) });
+    if (want) configureEden(s);                    // else: warming up, configured on the first cut
   } catch (e) {
     end(s, "eden: " + ((e && e.message) || e));
   }
 }
+
+// What's been sent to a session, as one comparable string (prompt + which anchor).
+function sentKey(engine) {
+  if (!want) return null;
+  const a = engine === "eden" ? want.prompts.anchor : null;
+  return promptFor(engine) + "|" + (a ? a.length + ":" + a.slice(-24) : "");
+}
+
+function configureEden(s) {
+  if (s.configureSent || !want) return;
+  s.configureSent = true;
+  s.sentPrompt = sentKey("eden");
+  startFrameClock(s);
+  if (!s.frames) setBusy(true);
+  const anchor = want.prompts.anchor;              // optional: a frame of you already wearing the cut
+  s.handle.send({ type: "configure", prompt: promptFor("eden"), enable_prompt_expansion: cfg.expandPrompt,
+                  ...(anchor ? { image_url: anchor } : {}) });
+  tell({ type: "session", engine: "eden", state: "configure", id: want.id, anchored: !!anchor });
+}
+
 
 function onEdenData(s, raw) {
   if (s.ended || s !== sess) return;
@@ -398,7 +415,7 @@ function onEdenData(s, raw) {
       return end(s, m.error || "eden error", m.retryable === false || isFatal(m.error));
     case "configured":
       s.configured = true;
-      if (want && promptFor("eden") !== s.sentPrompt) syncPrompt();
+      if (want && sentKey("eden") !== s.sentPrompt) syncPrompt();
       break;
     case "reset_applied":
     case "prompt_applied":
@@ -432,7 +449,7 @@ function connectLucy(retried) {
   s.ws = ws;
   ws.onopen = () => {
     const first = { prompt: promptFor("lucy") || "", enable_prompt_expansion: cfg.expandPrompt };
-    s.sentPrompt = first.prompt;
+    s.sentPrompt = sentKey("lucy");
     wireSend(s, first);
     tell({ type: "session", engine: "lucy", state: "socket-open", ms: since(s) });
   };
@@ -527,6 +544,11 @@ async function startLucyPeer(s, iceServers) {
 
 /* ---- shared */
 
+// Give up if no live picture arrives within cfg.firstFrameMs of asking for one.
+function startFrameClock(s) {
+  s.timers.push(setTimeout(() => { if (!s.frames && !s.ended) end(s, "no live video in time", true); }, cfg.firstFrameMs));
+}
+
 // Errors a retry can't fix: skip this engine for a while.
 function isFatal(why) {
   return /limit|unauthori[sz]ed|forbidden|balance|locked|not found|quota|credit|capacity/i.test(String(why || ""));
@@ -570,16 +592,18 @@ function syncPrompt() {
   const s = sess;
   if (!s || s.ended || !want) return;
   const prompt = promptFor(s.engine);
-  if (s.sentPrompt === prompt) return;
+  const key = sentKey(s.engine);
+  if (s.sentPrompt === key) return;
   if (s.engine === "eden") {
+    if (!s.configureSent) return configureEden(s);   // a warm session's first cut
     if (!s.configured) return;               // sent once Eden says "configured"
-    s.sentPrompt = prompt;
+    s.sentPrompt = key;
     // Re-anchor: on the given frame of you wearing the cut, or else on the newest camera
     // frame (Eden makes that one itself).
     s.handle.send({ type: "reset", prompt, image_url: want.prompts.anchor || null });
   } else {
     if (!s.live) return;
-    s.sentPrompt = prompt;
+    s.sentPrompt = key;
     wireSend(s, { prompt });
   }
   tell({ type: "session", engine: s.engine, state: "prompt", id: want.id });
@@ -662,7 +686,7 @@ window.mane = {
     }, cfg.maxQuietMs);
     const s = sess;
     if (s && !s.ended) {
-      if (s.sentPrompt === promptFor(s.engine)) {   // back to the cut that's already running
+      if (s.sentPrompt === sentKey(s.engine)) {     // back to the cut that's already running
         if (s.frames) { setBusy(false); showAI(true); tell({ type: "showing", id }); }
         return;
       }
@@ -684,6 +708,25 @@ window.mane = {
   },
 
   hold(on) { cls("hold", on); },
+
+  // Open the live session ahead of the first cut (Eden only), so it's ready when the cut is.
+  warm() {
+    clearTimeout(idleTimer);
+    if (sess || waitingForToken || pickEngine() !== "eden") return;
+    connectEden(false, true);
+    idleTimer = setTimeout(() => { if (!want) hangUp(); }, 60000);
+  },
+
+  // The camera frame as the model sees it (not mirrored), as a JPEG data URL.
+  frame(maxWidth, quality) {
+    if (!cam.videoWidth) return null;
+    const scale = Math.min(1, (maxWidth || cam.videoWidth) / cam.videoWidth);
+    const c = document.createElement("canvas");
+    c.width = Math.round(cam.videoWidth * scale);
+    c.height = Math.round(cam.videoHeight * scale);
+    c.getContext("2d").drawImage(cam, 0, 0, c.width, c.height);
+    return c.toDataURL("image/jpeg", quality || 0.85);
+  },
 
   // Photo fallback, driven by the app.
   busy(on) { setBusy(on); },

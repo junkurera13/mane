@@ -27,6 +27,38 @@ enum FalClient {
         throw Failure(status: 0, detail: "unexpected token reply")
     }
 
+    /// Nano Banana edit: returns the edited JPEG. Retries briefly when the account is at its
+    /// concurrency limit (429).
+    static func editPhoto(key: String, imageDataURL: String, prompt: String, aspectRatio: String) async throws -> Data {
+        let body: [String: Any] = [
+            "prompt": prompt,
+            "image_urls": [imageDataURL],
+            "num_images": 1,
+            "output_format": "jpeg",
+            "aspect_ratio": aspectRatio,
+        ]
+        var data = Data()
+        for attempt in 0..<5 {
+            do {
+                data = try await post("https://fal.run/fal-ai/nano-banana/edit", key: key, body: body, timeout: 90)
+                break
+            } catch let f as Failure where f.status == 429 && attempt < 4 {
+                try await Task.sleep(nanoseconds: UInt64(1_500_000_000) * UInt64(attempt + 1))
+            }
+        }
+        guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let images = obj["images"] as? [[String: Any]],
+              let urlString = images.first?["url"] as? String
+        else { throw Failure(status: 0, detail: "no image in reply") }
+        if urlString.hasPrefix("data:"), let comma = urlString.firstIndex(of: ","),
+           let decoded = Data(base64Encoded: String(urlString[urlString.index(after: comma)...])) {
+            return decoded
+        }
+        guard let url = URL(string: urlString) else { throw Failure(status: 0, detail: "bad image url") }
+        let (img, _) = try await URLSession.shared.data(from: url)
+        return img
+    }
+
     private static func post(_ urlString: String, key: String, body: [String: Any], timeout: TimeInterval) async throws -> Data {
         var req = URLRequest(url: URL(string: urlString)!, timeoutInterval: timeout)
         req.httpMethod = "POST"

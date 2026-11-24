@@ -29,6 +29,17 @@ final class MirrorEngine: NSObject, ObservableObject {
     private var nativeCam: NativeCamera?
     private var isOpen = false
 
+    // "You with the cut" frames that anchor Eden Live, made by Nano Banana from your camera.
+    // Kept for one opening of the mirror; the first tap makes one, then the rest are made in
+    // the background so later taps switch in about two seconds.
+    private var anchors: [String: String] = [:]          // style id -> small JPEG data URL
+    private var anchorQueue: [HairStyle] = []
+    private var anchorInFlight: Set<String> = []
+    private var anchorJobs = 0
+    private var prefetchStarted = false
+    private var generation = 0                           // bumps on open/close; stale work is dropped
+    private let maxAnchorJobs = 1                        // the live session uses one of fal's slots
+
     override init() {
         let config = WKWebViewConfiguration()
         config.mediaTypesRequiringUserActionForPlayback = []
@@ -72,6 +83,7 @@ final class MirrorEngine: NSObject, ObservableObject {
 
     func open() {
         isOpen = true
+        resetAnchors()
         if let demo = demoImage {
             camera = .on
             call("demo", Self.dataURL(demo))
@@ -100,6 +112,7 @@ final class MirrorEngine: NSObject, ObservableObject {
         isOpen = false
         active = nil
         busy = false
+        resetAnchors()
         call("close")
         nativeCam?.stop()
         if camera == .on { camera = .off }
@@ -115,7 +128,107 @@ final class MirrorEngine: NSObject, ObservableObject {
         active = style.id
         failedID = nil
         busy = true
-        call("apply", style.id, ["eden": style.edenPrompt, "lucy": style.livePrompt])
+        if let anchor = anchors[style.id] {
+            applyLive(style, anchor: anchor)
+        } else {
+            call("warm")                      // open the live session while the anchor is made
+            requestAnchor(style, urgent: true)
+        }
+    }
+
+    private func applyLive(_ style: HairStyle, anchor: String?) {
+        var prompts: [String: Any] = ["eden": style.edenPrompt, "lucy": style.livePrompt]
+        if let anchor { prompts["anchor"] = anchor }
+        call("apply", style.id, prompts)
+    }
+
+    // MARK: - Anchors
+
+    private func resetAnchors() {
+        generation += 1
+        anchors.removeAll()
+        anchorQueue.removeAll()
+        anchorInFlight.removeAll()
+        anchorJobs = 0
+        prefetchStarted = false
+    }
+
+    private func requestAnchor(_ style: HairStyle, urgent: Bool) {
+        guard anchors[style.id] == nil, !anchorInFlight.contains(style.id) else { return }
+        anchorQueue.removeAll { $0.id == style.id }
+        if urgent { anchorQueue.insert(style, at: 0) } else { anchorQueue.append(style) }
+        pumpAnchors()
+    }
+
+    private func pumpAnchors() {
+        guard let key = KeyStore.key else { return }
+        while anchorJobs < maxAnchorJobs, !anchorQueue.isEmpty {
+            let style = anchorQueue.removeFirst()
+            if anchors[style.id] != nil || anchorInFlight.contains(style.id) { continue }
+            anchorJobs += 1
+            anchorInFlight.insert(style.id)
+            let gen = generation
+            Task {
+                var made: String?
+                do {
+                    guard let frame = await self.cameraFrame() else {
+                        throw FalClient.Failure(status: 0, detail: "no camera frame")
+                    }
+                    let jpeg = try await FalClient.editPhoto(key: key, imageDataURL: frame,
+                                                             prompt: style.anchorPrompt, aspectRatio: "16:9")
+                    if gen == self.generation, let small = Self.anchorJPEG(jpeg) {
+                        made = "data:image/jpeg;base64," + small.base64EncodedString()
+                    }
+                    if let t = ThumbStore.save(style.id, jpeg: jpeg, mirrored: true) { self.thumbs[style.id] = t }
+                } catch {
+                    NSLog("Mane: anchor for \(style.id) failed: \(error)")
+                }
+                guard gen == self.generation else { return }
+                self.anchorJobs -= 1
+                self.anchorInFlight.remove(style.id)
+                if let made { self.anchors[style.id] = made }
+                // The cut you're waiting for: go live with it (without an anchor if making one
+                // failed; Eden then makes its own, and Lucy never needs one).
+                if self.active == style.id { self.applyLive(style, anchor: made) }
+                if made != nil { self.startPrefetch() }
+                self.pumpAnchors()
+            }
+        }
+    }
+
+    /// After the first cut, make the other built-in cuts' anchors in the background.
+    private func startPrefetch() {
+        guard !prefetchStarted else { return }
+        prefetchStarted = true
+        for style in HairStyle.builtIn where anchors[style.id] == nil { requestAnchor(style, urgent: false) }
+    }
+
+    private func cameraFrame() async -> String? {
+        guard loaded else { return nil }
+        let r = try? await webView.callAsyncJavaScript("return mane.frame(896, 0.85)", arguments: [:],
+                                                       in: nil, contentWorld: .page)
+        return r as? String
+    }
+
+    /// Eden takes the anchor as a data URL under ~45 KB.
+    static func anchorJPEG(_ jpeg: Data) -> Data? {
+        guard let src = NSImage(data: jpeg), let rep0 = src.representations.first else { return nil }
+        let w0 = CGFloat(rep0.pixelsWide), h0 = CGFloat(rep0.pixelsHigh)
+        guard w0 > 0, h0 > 0 else { return nil }
+        let w = min(640, w0), h = (h0 * w / w0).rounded()
+        guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int(w), pixelsHigh: Int(h),
+                                         bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                                         colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)
+        else { return nil }
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+        NSGraphicsContext.current?.imageInterpolation = .high
+        src.draw(in: NSRect(x: 0, y: 0, width: w, height: h))
+        NSGraphicsContext.restoreGraphicsState()
+        for q in [0.8, 0.7, 0.6, 0.5, 0.4] {
+            if let d = rep.representation(using: .jpeg, properties: [.compressionFactor: q]), d.count < 44_000 { return d }
+        }
+        return nil
     }
 
     func revert() {
@@ -335,7 +448,7 @@ final class MirrorEngine: NSObject, ObservableObject {
     }
 
     private func captureLiveThumb(_ id: String) {
-        guard active == id else { return }
+        guard active == id, anchors[id] == nil else { return }
         Task {
             guard let url = await snapshot(size: 288, source: "ai"),
                   let comma = url.firstIndex(of: ","),

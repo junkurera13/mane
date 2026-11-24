@@ -11,6 +11,12 @@ struct HairStyle: Identifiable, Hashable, Codable {
         "Change the person's hair to \(look). Keep the same face, identity, expression, clothing and background."
     }
 
+    /// For Nano Banana, making the "you with the cut" frame that anchors Eden Live.
+    var anchorPrompt: String {
+        "Edit only the hair: give this person \(look). Keep exactly the same face, identity, expression, skin, "
+            + "lighting, clothing, background, camera angle and framing. Photorealistic photo."
+    }
+
     /// Eden Live wants a description of what the video should look like.
     var edenPrompt: String {
         "A photorealistic live video of the same person with \(look). Same face, identity, expression, skin, "
@@ -90,7 +96,7 @@ enum ThumbStore {
         return out
     }
 
-    static func save(_ id: String, jpeg: Data) -> NSImage? {
+    static func save(_ id: String, jpeg: Data, mirrored: Bool = false) -> NSImage? {
         guard let src = NSImage(data: jpeg) else { return nil }
         let side: CGFloat = 144
         let thumb = NSImage(size: NSSize(width: side, height: side))
@@ -100,6 +106,12 @@ enum ThumbStore {
         // your head and hair rather than the whole room.
         let s = src.size, m = min(s.width, s.height) * 0.62
         let cx = s.width / 2, cy = s.height * 0.63
+        if mirrored {   // camera frames aren't mirrored; the circles show you as the mirror does
+            let t = NSAffineTransform()
+            t.translateX(by: side, yBy: 0)
+            t.scaleX(by: -1, yBy: 1)
+            t.concat()
+        }
         src.draw(in: NSRect(x: 0, y: 0, width: side, height: side),
                  from: NSRect(x: cx - m / 2, y: min(max(cy - m / 2, 0), s.height - m), width: m, height: m),
                  operation: .copy, fraction: 1)
