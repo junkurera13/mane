@@ -291,7 +291,7 @@ function connect() {
   const s = {
     ws: null, pc: null, live: false, ended: false,
     hasRemote: false, pending: [], iceTimer: null, negTimer: null,
-    sentPrompt: null, t0: performance.now(), frames: false,
+    sentPrompt: null, t0: performance.now(), frames: false, frameTimer: null,
   };
   sess = s;
   setBusy(true);
@@ -348,6 +348,8 @@ async function onSignal(s, m) {
       for (const c of s.pending.splice(0)) await s.pc.addIceCandidate(c).catch(() => {});
       clearTimeout(s.negTimer);
       s.live = true;
+      // Connected but no picture (e.g. a network that blocks WebRTC): give up, use the photo.
+      s.frameTimer = setTimeout(() => { if (!s.frames) end(s, "no video from Lucy", true); }, 15000);
       tell({ type: "session", state: "negotiated", ms: Math.round(performance.now() - s.t0) });
       syncPrompt();
       break;
@@ -447,7 +449,7 @@ function syncPrompt() {
 function end(s, reason, fatal) {
   if (!s || s.ended) return;
   s.ended = true;
-  clearTimeout(s.negTimer); clearTimeout(s.iceTimer);
+  clearTimeout(s.negTimer); clearTimeout(s.iceTimer); clearTimeout(s.frameTimer);
   try { s.pc && s.pc.close(); } catch (_) {}
   try { if (s.ws && s.ws.readyState <= 1) s.ws.close(1000); } catch (_) {}
   const wasCurrent = s === sess;

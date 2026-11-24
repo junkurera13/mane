@@ -66,6 +66,7 @@ final class NotchPanel: NSPanel {
         hidesOnDeactivate = false
         isReleasedWhenClosed = false
         animationBehavior = .none
+        appearance = NSAppearance(named: .darkAqua)   // the glass always reads as dark, like the notch
     }
 
     override var canBecomeKey: Bool { true }
