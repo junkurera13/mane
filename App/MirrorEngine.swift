@@ -325,16 +325,13 @@ final class MirrorEngine: NSObject, ObservableObject {
                 cameraFailed(m["error"] as? String ?? "")
             }
 
-        case "session":
-            let state = m["state"] as? String ?? ""
-            if state == "frames", let id = active {
-                // Grab your face with the new cut for the circle, once it has settled.
-                DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
-                    self?.captureLiveThumb(id)
-                }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
-                    if self?.active == id { self?.busy = false }
-                }
+        case "showing":
+            // The live video now shows this cut.
+            guard let id = m["id"] as? String, id == active else { return }
+            busy = false
+            // Grab your face with the new cut for the circle, once it has settled.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+                self?.captureLiveThumb(id)
             }
 
         case "failed":

@@ -147,7 +147,7 @@ final class NotchController: NSObject {
             size = CGSize(width: g.islandSize.width + NotchGeometry.ear * 2 + NotchGeometry.shadowPad * 2,
                           height: g.islandSize.height + NotchGeometry.shadowPad * 1.5)
         } else {
-            size = CGSize(width: g.notch.width + 24, height: g.notch.height + 8)
+            size = CGSize(width: g.notch.width + 24, height: g.notch.height + 6)
         }
         let frame = NSRect(x: g.notchCenterX - size.width / 2, y: g.screenFrame.maxY - size.height,
                            width: size.width, height: size.height)

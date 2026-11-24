@@ -428,6 +428,7 @@ function watchFrames(s) {
       setBusy(false);
       showAI(!!want);
       retried = false;
+      if (want) tell({ type: "showing", id: want.id });
     }, 350);
   };
   if (ai.requestVideoFrameCallback) ai.requestVideoFrameCallback(() => onFrame());
@@ -515,7 +516,14 @@ window.mane = {
     retried = false;
     if (sess && sess.live) {
       syncPrompt();
-      if (sess.frames) showAI(true);
+      if (sess.frames) {
+        showAI(true);
+        // Lucy morphs to the new cut within about a second.
+        const s = sess, wid = id;
+        setTimeout(() => {
+          if (s === sess && !s.ended && want && want.id === wid) tell({ type: "showing", id: wid });
+        }, 900);
+      }
     } else if (!sess) {
       connect();
     }
