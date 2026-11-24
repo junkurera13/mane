@@ -380,7 +380,9 @@ async function connectEden(retried) {
     });
     s.handle = handle;
     s.sentPrompt = promptFor("eden");
-    handle.send({ type: "configure", prompt: s.sentPrompt, enable_prompt_expansion: cfg.expandPrompt });
+    const anchor = want && want.prompts.anchor;    // optional: a frame of you already wearing the cut
+    handle.send({ type: "configure", prompt: s.sentPrompt, enable_prompt_expansion: cfg.expandPrompt,
+                  ...(anchor ? { image_url: anchor } : {}) });
   } catch (e) {
     end(s, "eden: " + ((e && e.message) || e));
   }
@@ -572,8 +574,9 @@ function syncPrompt() {
   if (s.engine === "eden") {
     if (!s.configured) return;               // sent once Eden says "configured"
     s.sentPrompt = prompt;
-    // Re-anchor on the newest camera frame wearing the new cut.
-    s.handle.send({ type: "reset", prompt });
+    // Re-anchor: on the given frame of you wearing the cut, or else on the newest camera
+    // frame (Eden makes that one itself).
+    s.handle.send({ type: "reset", prompt, image_url: want.prompts.anchor || null });
   } else {
     if (!s.live) return;
     s.sentPrompt = prompt;

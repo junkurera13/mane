@@ -17,12 +17,18 @@ const here = dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
 const opt = (name, dflt) => { const i = args.indexOf("--" + name); return i >= 0 ? args[i + 1] : dflt; };
 const styles = [];
-args.forEach((a, i) => { if (a === "--style") { const [id, ...rest] = args[i + 1].split("="); styles.push({ id, prompt: rest.join("=") }); } });
+const anchors = {};
+args.forEach((a, i) => {
+  if (a === "--style") { const [id, ...rest] = args[i + 1].split("="); styles.push({ id, prompt: rest.join("=") }); }
+  if (a === "--anchor") { const [id, file] = args[i + 1].split("="); anchors[id] = file; }
+});
 
 const video = resolve(opt("video", "face.mjpeg"));
 const out = resolve(opt("out", "shots"));
 const seconds = Number(opt("seconds", "6"));
 const engines = opt("engines", "eden,lucy").split(",");
+const edenEndpoint = opt("eden-endpoint", "vast/eden-live-5b-video");
+const record = args.includes("--record");
 const expand = opt("expand", "false") === "true";
 const extraArgs = (opt("chrome-args", "") || "").split(" ").filter(Boolean);
 const key = process.env.FAL_KEY;
@@ -52,7 +58,11 @@ const browser = await chromium.launch({
     ...extraArgs,
   ],
 });
-const page = await browser.newPage({ viewport: { width: 640, height: 640 } });
+const context = await browser.newContext({
+  viewport: { width: 640, height: 640 },
+  ...(record ? { recordVideo: { dir: out, size: { width: 640, height: 640 } } } : {}),
+});
+const page = await context.newPage();
 const events = [];
 await page.exposeBinding("__maneNative", (_src, msg) => {
   events.push(msg);
@@ -76,7 +86,7 @@ await page.addInitScript({ content: falBundle });
 page.on("console", (m) => console.log("  console:", m.text()));
 await page.route("https://mane.test/**", (r) => r.fulfill({ contentType: "text/html", body: html }));
 await page.goto("https://mane.test/");
-await page.evaluate((c) => window.mane.config(c), { engines, expandPrompt: expand });
+await page.evaluate((c) => window.mane.config(c), { engines, expandPrompt: expand, eden: { endpoint: edenEndpoint, revealMs: 500 } });
 
 console.log("open camera");
 await page.evaluate(() => window.mane.open());
@@ -93,7 +103,8 @@ let n = 1;
 for (const s of styles) {
   console.log(`style ${s.id}: ${s.prompt}`);
   const t0 = Date.now();
-  await page.evaluate(({ id, prompt }) => window.mane.apply(id, prompt), s);
+  const anchor = anchors[s.id] ? "data:image/jpeg;base64," + readFileSync(anchors[s.id]).toString("base64") : undefined;
+  await page.evaluate(({ id, prompt, anchor }) => window.mane.apply(id, anchor ? { eden: prompt, lucy: prompt, anchor } : prompt), { ...s, anchor });
   const ok = await waitFor(() => window.mane.state().showingAI && !window.mane.state().busy, 60000);
   console.log(`  showing AI: ${ok} after ${Date.now() - t0} ms`);
   for (let k = 1; k <= 3; k++) {
@@ -109,4 +120,5 @@ await page.waitForTimeout(800);
 await page.screenshot({ path: join(out, `${String(n).padStart(2, "0")}-real-again.png`) });
 await page.evaluate(() => window.mane.close());
 writeFileSync(join(out, "events.json"), JSON.stringify(events, null, 1));
+await context.close();
 await browser.close();
