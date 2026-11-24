@@ -7,7 +7,7 @@
 // Needs Playwright with Chromium (`npm i -g playwright` + `npx playwright install chromium`).
 // Each run opens one live session: about 2¢ per second on fal.
 import { createRequire } from "node:module";
-import { execFileSync } from "node:child_process";
+import { execFileSync, execFile } from "node:child_process";
 import { readFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -105,12 +105,20 @@ const waitFor = async (pred, ms) => {
   return false;
 };
 
+// Like the app, never block while a request is out (a blocked test process stalls the browser).
+function curl(args, input) {
+  return new Promise((resolve, reject) => {
+    const child = execFile("curl", args, { encoding: "buffer", maxBuffer: 64 << 20 }, (err, stdout) => err ? reject(err) : resolve(stdout));
+    if (input !== undefined) { child.stdin.end(input); }
+  });
+}
+
 async function makeAnchor(look) {
   const frame = await page.evaluate(() => window.mane.frame(896, 0.85));
   const body = JSON.stringify({ prompt: anchorPrompt(look), image_urls: [frame], num_images: 1, output_format: "jpeg", aspect_ratio: "16:9" });
-  const res = JSON.parse(execFileSync("curl", ["-sS", "-m", "90", "-X", "POST", "https://fal.run/fal-ai/nano-banana/edit",
-    "-H", "Authorization: Key " + key, "-H", "Content-Type: application/json", "--data-binary", "@-"], { input: body }).toString());
-  const img = execFileSync("curl", ["-sS", "-m", "60", res.images[0].url]);
+  const res = JSON.parse((await curl(["-sS", "-m", "90", "-X", "POST", "https://fal.run/fal-ai/nano-banana/edit",
+    "-H", "Authorization: Key " + key, "-H", "Content-Type: application/json", "--data-binary", "@-"], body)).toString());
+  const img = await curl(["-sS", "-m", "60", res.images[0].url]);
   const src = "data:image/jpeg;base64," + img.toString("base64");
   return page.evaluate(async (src) => {
     const im = new Image(); im.src = src; await im.decode();
@@ -124,6 +132,7 @@ async function makeAnchor(look) {
 let n = 1;
 if (appFlow) {
   const cache = {};
+  let prefetch = null;
   for (const [i, s] of styles.entries()) {
     const look = s.prompt;
     console.log(`style ${s.id}: ${look}`);
@@ -138,11 +147,21 @@ if (appFlow) {
     await page.evaluate(({ id, p }) => window.mane.apply(id, p), { id: s.id, p: { eden: edenPrompt(look), lucy: livePrompt(look), anchor: cache[s.id] } });
     const ok = await waitFor(() => window.mane.state().showingAI && !window.mane.state().busy, 100000);
     console.log(`  showing AI: ${ok} after ${Date.now() - t1} ms from apply (${Date.now() - t0} ms from tap)`);
-    // Like the app: after the first cut, make the next ones' anchors while this one plays.
-    if (i === 0) for (const nx of styles.slice(1)) {
-      const ta = Date.now(); cache[nx.id] = await makeAnchor(nx.prompt);
-      console.log(`  prefetched anchor ${nx.id}: ${Date.now() - ta} ms`);
-      writeFileSync(join(out, `anchor-${nx.id}.jpg`), Buffer.from(cache[nx.id].split(",")[1], "base64"));
+    // Like the app: after the first cut, make the next ones' anchors in the background.
+    if (i === 0) prefetch = (async () => {
+      for (const nx of styles.slice(1)) {
+        const ta = Date.now(); cache[nx.id] = await makeAnchor(nx.prompt);
+        console.log(`  prefetched anchor ${nx.id}: ${Date.now() - ta} ms`);
+        writeFileSync(join(out, `anchor-${nx.id}.jpg`), Buffer.from(cache[nx.id].split(",")[1], "base64"));
+      }
+    })();
+    if (i === 0) {
+      // Watch the first cut for a while, the way someone would, while the others are made.
+      for (let k = 1; k <= 6; k++) {
+        await page.waitForTimeout(5000);
+        await page.screenshot({ path: join(out, `${String(n).padStart(2, "0")}-${s.id}-watch-${k}.png`) });
+      }
+      await prefetch;
     }
     for (let k = 1; k <= 3; k++) {
       await page.waitForTimeout((seconds * 1000) / 3);
@@ -154,7 +173,7 @@ if (appFlow) {
 for (const s of appFlow ? [] : styles) {
   console.log(`style ${s.id}: ${s.prompt}`);
   const t0 = Date.now();
-  const anchor = anchors[s.id] ? "data:image/jpeg;base64," + readFileSync(anchors[s.id]).toString("base64") : undefined;
+  const anchor = anchors[s.id] ? "data:image/jpeg;base64," + readFileSync(anchors[s.id]).toString("base64") : undefined; // eslint-disable-line
   await page.evaluate(({ id, prompt, anchor }) => window.mane.apply(id, anchor ? { eden: prompt, lucy: prompt, anchor } : prompt), { ...s, anchor });
   const ok = await waitFor(() => window.mane.state().showingAI && !window.mane.state().busy, 60000);
   console.log(`  showing AI: ${ok} after ${Date.now() - t0} ms`);
