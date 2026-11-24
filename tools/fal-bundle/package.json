@@ -1,0 +1,14 @@
+{
+  "name": "mane-fal-bundle",
+  "private": true,
+  "description": "Builds web/vendor/fal-realtime.js: fal's official realtime client (WMA + Lucy), pinned.",
+  "scripts": {
+    "build": "esbuild entry.js --bundle --minify --format=iife --target=safari16 --outfile=../../web/vendor/fal-realtime.js --legal-comments=none"
+  },
+  "dependencies": {
+    "@fal-ai/client": "1.11.0-alpha.6"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.10"
+  }
+}

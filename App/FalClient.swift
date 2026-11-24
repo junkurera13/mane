@@ -1,11 +1,9 @@
 import Foundation
 
-/// The two fal.ai calls Mane makes.
+/// fal.ai calls made natively. (Eden Live's session calls go through FalBridge.)
 enum FalClient {
-    /// Live model (WebRTC, ~2¢/s while connected).
+    /// Lucy, the second live engine (WebRTC, ~2¢/s while connected).
     static let liveEndpoint = "decart/lucy-2-6/realtime"
-    /// Photo model used when the live stream can't start (~4¢ per photo).
-    static let photoEndpoint = "fal-ai/nano-banana/edit"
 
     struct Failure: Error, CustomStringConvertible {
         let status: Int
@@ -27,32 +25,6 @@ enum FalClient {
         if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
            let token = obj["detail"] as? String { return token }
         throw Failure(status: 0, detail: "unexpected token reply")
-    }
-
-    /// Edits a square photo (a data: URL) and returns the edited JPEG.
-    static func editPhoto(key: String, imageDataURL: String, prompt: String) async throws -> Data {
-        let body: [String: Any] = [
-            "prompt": prompt,
-            "image_urls": [imageDataURL],
-            "num_images": 1,
-            "output_format": "jpeg",
-            "aspect_ratio": "1:1",
-        ]
-        let data = try await post("https://fal.run/" + photoEndpoint, key: key, body: body, timeout: 90)
-        guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let images = obj["images"] as? [[String: Any]],
-              let urlString = images.first?["url"] as? String
-        else { throw Failure(status: 0, detail: "no image in reply") }
-        if urlString.hasPrefix("data:"), let comma = urlString.firstIndex(of: ","),
-           let decoded = Data(base64Encoded: String(urlString[urlString.index(after: comma)...])) {
-            return decoded
-        }
-        guard let url = URL(string: urlString) else { throw Failure(status: 0, detail: "bad image url") }
-        let (img, resp) = try await URLSession.shared.data(from: url)
-        if let http = resp as? HTTPURLResponse, http.statusCode != 200 {
-            throw Failure(status: http.statusCode, detail: "image download failed")
-        }
-        return img
     }
 
     private static func post(_ urlString: String, key: String, body: [String: Any], timeout: TimeInterval) async throws -> Data {

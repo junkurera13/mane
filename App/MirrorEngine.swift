@@ -3,7 +3,7 @@ import AVFoundation
 import WebKit
 
 /// Owns the mirror: a WKWebView running web/mirror.html (camera + live AI video over
-/// WebRTC), plus the photo fallback and the circles' state.
+/// WebRTC through fal: Eden Live first, Lucy second), plus the circles' state.
 @MainActor
 final class MirrorEngine: NSObject, ObservableObject {
     enum Camera { case off, on, denied }
@@ -26,9 +26,6 @@ final class MirrorEngine: NSObject, ObservableObject {
     private var loaded = false
     private var queued: [(String, String)] = []
     private var minting = false
-    private var liveBlockedUntil: Date?
-    private var stills: [String: String] = [:]           // photo results for this opening
-    private var photoInFlight: Set<String> = []
     private var nativeCam: NativeCamera?
     private var isOpen = false
 
@@ -42,7 +39,16 @@ final class MirrorEngine: NSObject, ObservableObject {
         wv.allowsBackForwardNavigationGestures = false
         webView = wv
         super.init()
-        wv.configuration.userContentController.add(WeakHandler(self), name: "mane")
+        let ucc = wv.configuration.userContentController
+        ucc.add(WeakHandler(self), name: "mane")
+        ucc.addScriptMessageHandler(FalBridge(), contentWorld: .page, name: "maneFetch")
+        // fal's realtime client (web/vendor/fal-realtime.js) → window.FalRealtime
+        if let url = Bundle.main.url(forResource: "fal-realtime", withExtension: "js", subdirectory: "web/vendor"),
+           let js = try? String(contentsOf: url, encoding: .utf8) {
+            ucc.addUserScript(WKUserScript(source: js, injectionTime: .atDocumentStart, forMainFrameOnly: true))
+        } else {
+            NSLog("Mane: fal-realtime.js is missing from the app bundle")
+        }
         wv.uiDelegate = self
         wv.navigationDelegate = self
         container.install(webView: wv)
@@ -66,7 +72,6 @@ final class MirrorEngine: NSObject, ObservableObject {
 
     func open() {
         isOpen = true
-        stills.removeAll()
         if let demo = demoImage {
             camera = .on
             call("demo", Self.dataURL(demo))
@@ -95,7 +100,6 @@ final class MirrorEngine: NSObject, ObservableObject {
         isOpen = false
         active = nil
         busy = false
-        stills.removeAll()
         call("close")
         nativeCam?.stop()
         if camera == .on { camera = .off }
@@ -107,30 +111,17 @@ final class MirrorEngine: NSObject, ObservableObject {
         guard camera == .on else { return }
         guard KeyStore.key != nil else { onNeedsKey?(); return }
         if active == style.id { revert(); return }
+        guard nativeCam == nil, demoImage == nil else { return }   // live needs WebKit's camera
         active = style.id
         failedID = nil
-        if let still = stills[style.id] {
-            busy = false
-            call("apply", NSNull(), NSNull())
-            call("showStill", still)
-            return
-        }
-        if useLive {
-            busy = true
-            call("hideStill")
-            call("apply", style.id, style.livePrompt)
-        } else {
-            call("apply", NSNull(), NSNull())
-            startPhoto(style)
-        }
+        busy = true
+        call("apply", style.id, ["eden": style.edenPrompt, "lucy": style.livePrompt])
     }
 
     func revert() {
         active = nil
         busy = false
-        call("busy", false)
         call("apply", NSNull(), NSNull())
-        call("hideStill")
     }
 
     func addCustom(_ text: String) {
@@ -204,52 +195,15 @@ final class MirrorEngine: NSObject, ObservableObject {
         }
     }
 
-    private var useLive: Bool {
-        guard nativeCam == nil, demoImage == nil else { return false }
-        if let until = liveBlockedUntil, until > Date() { return false }
-        return true
-    }
-
-    // MARK: - Photo fallback
-
-    private func startPhoto(_ style: HairStyle) {
-        guard let key = KeyStore.key else { onNeedsKey?(); return }
-        busy = true
-        call("busy", true)
-        guard !photoInFlight.contains(style.id) else { return }
-        photoInFlight.insert(style.id)
-        Task {
-            defer { self.photoInFlight.remove(style.id) }
-            do {
-                guard let shot = await self.snapshot(size: 768, source: "cam") else {
-                    throw FalClient.Failure(status: 0, detail: "no camera frame")
-                }
-                let jpeg = try await FalClient.editPhoto(key: key, imageDataURL: shot, prompt: style.photoPrompt)
-                let url = "data:image/jpeg;base64," + jpeg.base64EncodedString()
-                if let t = ThumbStore.save(style.id, jpeg: jpeg) { self.thumbs[style.id] = t }
-                guard self.isOpen else { return }
-                self.stills[style.id] = url
-                if self.active == style.id {
-                    self.busy = false
-                    self.call("busy", false)
-                    self.call("showStill", url)
-                }
-            } catch {
-                NSLog("Mane: photo failed: \(error)")
-                if self.active == style.id { self.fail(style.id, error) }
-            }
-        }
-    }
-
-    private func fail(_ id: String, _ error: Error) {
+    /// A live session couldn't start: shake the circle and go back to your real hair.
+    private func fail(_ id: String, reason: String) {
+        NSLog("Mane: live failed for \(id): \(reason)")
         busy = false
         active = nil
         failedID = id
         shake += 1
-        call("busy", false)
         call("apply", NSNull(), NSNull())
-        call("hideStill")
-        if let f = error as? FalClient.Failure, f.isAccountProblem {
+        if reason.range(of: "unauthori|balance|locked|401|403|invalid key", options: [.regularExpression, .caseInsensitive]) != nil {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { self.onNeedsKey?() }
         }
     }
@@ -354,11 +308,7 @@ final class MirrorEngine: NSObject, ObservableObject {
 
         case "failed":
             guard let id = m["id"] as? String else { return }
-            let reason = m["reason"] as? String ?? ""
-            NSLog("Mane: live session failed (\(reason)); using the photo fallback")
-            // Don't keep knocking on a door that says it's full.
-            liveBlockedUntil = Date().addingTimeInterval(m["fatal"] as? Bool == true ? 300 : 60)
-            if active == id, let style = allStyles.first(where: { $0.id == id }) { startPhoto(style) }
+            if active == id { fail(id, reason: m["reason"] as? String ?? "") }
 
         case "timeout":
             active = nil
@@ -380,9 +330,6 @@ final class MirrorEngine: NSObject, ObservableObject {
             } catch {
                 NSLog("Mane: token failed: \(error)")
                 self.call("tokenFailed", "\(error)")
-                if let f = error as? FalClient.Failure, f.isAccountProblem, let id = self.active {
-                    self.fail(id, f)
-                }
             }
         }
     }
@@ -442,6 +389,37 @@ extension MirrorEngine: WKUIDelegate, WKNavigationDelegate {
         loaded = false
         loadPage()
         if isOpen { DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.open() } }
+    }
+}
+
+/// The page's fal client makes its HTTP calls (session setup, heartbeats) through here, so the
+/// key is added natively and never enters the web page. Only fal's own hosts are allowed.
+final class FalBridge: NSObject, WKScriptMessageHandlerWithReply {
+    private static let allowedHosts: Set<String> = ["wma.fal.run", "rest.fal.ai", "fal.run", "queue.fal.run"]
+
+    func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage,
+                               replyHandler: @escaping (Any?, String?) -> Void) {
+        guard let req = message.body as? [String: Any],
+              let urlString = req["url"] as? String, let url = URL(string: urlString),
+              url.scheme == "https", let host = url.host, Self.allowedHosts.contains(host)
+        else { replyHandler(nil, "blocked request"); return }
+        guard let key = KeyStore.key else { replyHandler(nil, "no fal key"); return }
+        var r = URLRequest(url: url, timeoutInterval: 120)
+        r.httpMethod = (req["method"] as? String) ?? "GET"
+        for (name, value) in (req["headers"] as? [String: String]) ?? [:] where name.lowercased() != "authorization" {
+            r.setValue(value, forHTTPHeaderField: name)
+        }
+        r.setValue("Key " + key, forHTTPHeaderField: "Authorization")
+        if let body = req["body"] as? String { r.httpBody = Data(body.utf8) }
+        URLSession.shared.dataTask(with: r) { data, response, error in
+            let http = response as? HTTPURLResponse
+            let reply: [String: Any] = [
+                "status": http?.statusCode ?? 599,
+                "body": data.flatMap { String(data: $0, encoding: .utf8) } ?? (error.map { "\($0)" } ?? ""),
+                "contentType": http?.value(forHTTPHeaderField: "Content-Type") ?? "application/json",
+            ]
+            DispatchQueue.main.async { replyHandler(reply, nil) }
+        }.resume()
     }
 }
 

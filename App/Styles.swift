@@ -1,7 +1,7 @@
 import AppKit
 
 /// A haircut you can try. `look` is the plain description that gets slotted into the
-/// prompts for the live model (Decart Lucy) and the photo model (Nano Banana).
+/// prompts for the live models (Eden Live and Decart Lucy).
 struct HairStyle: Identifiable, Hashable, Codable {
     let id: String
     let look: String
@@ -11,9 +11,10 @@ struct HairStyle: Identifiable, Hashable, Codable {
         "Change the person's hair to \(look). Keep the same face, identity, expression, clothing and background."
     }
 
-    var photoPrompt: String {
-        "Edit only the hair: give this person \(look). Keep exactly the same face, identity, expression, skin, "
-            + "lighting, clothing, background, camera angle and framing. Photorealistic photo."
+    /// Eden Live wants a description of what the video should look like.
+    var edenPrompt: String {
+        "A photorealistic live video of the same person with \(look). Same face, identity, expression, skin, "
+            + "clothing, lighting and background as the camera."
     }
 
     /// The little picture in the circle before you've tried it on yourself.

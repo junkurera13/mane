@@ -16,6 +16,8 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/web"
 cp "$BIN" "$APP/Contents/MacOS/Mane"
 sed -e "s/__VERSION__/$VERSION/" -e "s/__BUILD__/$BUILD/" Resources/Info.plist > "$APP/Contents/Info.plist"
 cp web/mirror.html "$APP/Contents/Resources/web/"
+mkdir -p "$APP/Contents/Resources/web/vendor"
+cp web/vendor/fal-realtime.js "$APP/Contents/Resources/web/vendor/"
 [ -d Resources/styles ] && cp -R Resources/styles "$APP/Contents/Resources/styles"
 if [ -f Resources/AppIcon-1024.png ]; then
   ICONSET="build/AppIcon.iconset"

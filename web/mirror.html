@@ -79,11 +79,17 @@
 
 /* ------------------------------------------------------------------ config */
 const cfg = {
-  endpoint: "decart/lucy-2-6/realtime",
-  expandPrompt: false,       // our prompts are already written for Lucy
+  // Live engines, tried in order. Eden Live (VAST, via fal WMA) re-renders the camera in the
+  // look of an anchor frame; Lucy (Decart, via fal) edits the camera video directly.
+  engines: ["eden", "lucy"],
+  eden: { endpoint: "vast/eden-live-5b-video", revealMs: 500 },
+  lucy: { endpoint: "decart/lucy-2-6/realtime" },
+  expandPrompt: false,       // our prompts are already written out
   idleCloseMs: 12000,        // back on your real hair this long -> hang up (stop paying)
   maxQuietMs: 180000,        // no taps for 3 min while live -> back to real, hang up
-  negotiationMs: 20000,
+  negotiationMs: 30000,      // Lucy: socket answer
+  firstFrameMs: 45000,       // any engine: first live frame
+  blockMs: 300000,           // an engine that refused us is skipped this long
   tokenMaxAgeMs: 100000,     // fal realtime tokens live 120 s
 };
 
@@ -266,12 +272,38 @@ function useToken() {
   return t;
 }
 
+/* ------------------------------------------------------ fal client (Eden) */
+// fal's official realtime client (web/vendor/fal-realtime.js, injected by the app as
+// window.FalRealtime). Its HTTP calls go through the app, which adds the fal key, so the
+// key never enters this page.
+async function bridgeFetch(url, init = {}) {
+  if (window.__maneTestFetch) return window.__maneTestFetch(url, init);
+  const headers = {};
+  new Headers(init.headers || {}).forEach((v, k) => { headers[k] = v; });
+  const r = await window.webkit.messageHandlers.maneFetch.postMessage({
+    url: String(url), method: init.method || "GET", headers,
+    body: typeof init.body === "string" ? init.body : null,
+  });
+  const empty = [101, 204, 205, 304].includes(r.status);
+  return new Response(empty ? null : (r.body || ""), {
+    status: r.status, headers: { "content-type": r.contentType || "application/json" },
+  });
+}
+let falClient = null;
+function fal() {
+  if (!falClient) {
+    if (!window.FalRealtime) throw new Error("fal realtime client missing");
+    falClient = window.FalRealtime.createFalClient({ fetch: bridgeFetch });
+  }
+  return falClient;
+}
+
 /* --------------------------------------------------------------- session */
-let sess = null;                     // the live Lucy session, if any
+let sess = null;                     // the live session (Eden or Lucy), if any
 let want = null;                     // { id, prompt } the user wants to see, or null = real hair
-let waitingForToken = false;
+let waitingForToken = null;          // a Lucy attempt waiting for its token: { retried }
 let idleTimer = null, quietTimer = null;
-let retried = false;
+const blockedUntil = {};             // engine -> Date.now() before which it's skipped
 
 function setBusy(on) { cls("busy", on); }
 
@@ -280,48 +312,143 @@ function showAI(on) {
   if (on) cls("still", false);
 }
 
+const since = (s) => Math.round(performance.now() - s.t0);
+
+// The first engine in cfg.engines (after `after`, if given) that isn't blocked.
+function pickEngine(after) {
+  const list = cfg.engines;
+  for (let i = after ? list.indexOf(after) + 1 : 0; i < list.length; i++) {
+    if (!(blockedUntil[list[i]] > Date.now())) return list[i];
+  }
+  return null;
+}
+
+function newSession(engine, retried) {
+  const s = {
+    engine, retried: !!retried, ended: false, live: false, frames: false,
+    t0: performance.now(), sentPrompt: null, timers: [],
+    // Lucy
+    ws: null, pc: null, hasRemote: false, pending: [],
+    // Eden
+    handle: null, configured: false, lastError: null,
+  };
+  sess = s;
+  setBusy(true);
+  tell({ type: "session", engine, state: "connecting" });
+  s.timers.push(setTimeout(() => { if (!s.frames) end(s, "no live video in time", true); }, cfg.firstFrameMs));
+  return s;
+}
+
+function connect(engine, retried) {
+  engine = engine || pickEngine();
+  if (!engine) {
+    if (want) { tell({ type: "failed", id: want.id, reason: "no live engine available", fatal: true }); want = null; }
+    setBusy(false);
+    return;
+  }
+  if (engine === "eden") return connectEden(retried);
+  return connectLucy(retried);
+}
+
+/* ---- Eden Live (fal WMA: HTTP signalling through the app, WebRTC media + data channel) */
+async function connectEden(retried) {
+  const s = newSession("eden", retried);
+  try {
+    const stream = await openCamera();
+    if (s.ended) return;
+    const handle = fal().realtime.open(window.FalRealtime.wma(cfg.eden.endpoint), {
+      receive: ["video"],
+      localStream: stream,
+      onMedia: (media) => {
+        if (s.ended) return;
+        ai.srcObject = media;
+        ai.play().catch(() => {});
+        watchFrames(s);
+      },
+      onData: (raw) => onEdenData(s, raw),
+      onState: (state) => {
+        tell({ type: "session", engine: "eden", state, ms: since(s) });
+        if (state === "live") s.live = true;
+        if (state === "failed") end(s, s.lastError || "eden session failed", isFatal(s.lastError));
+        if (state === "closed" && !s.ended) end(s, "eden session closed");
+      },
+      onError: (e) => { s.lastError = String((e && e.message) || e); },
+      onDiagnostic: (d) => {
+        if (d.kind === "progress" && d.phase === "ice-candidate") return;
+        tell({ type: "diag", engine: "eden", kind: d.kind, phase: d.phase, message: d.message, detail: d.detail });
+      },
+    });
+    s.handle = handle;
+    s.sentPrompt = promptFor("eden");
+    handle.send({ type: "configure", prompt: s.sentPrompt, enable_prompt_expansion: cfg.expandPrompt });
+  } catch (e) {
+    end(s, "eden: " + ((e && e.message) || e));
+  }
+}
+
+function onEdenData(s, raw) {
+  if (s.ended || s !== sess) return;
+  let m;
+  try { m = JSON.parse(raw); } catch (_) { return; }
+  if (m.type !== "pong") tell({ type: "signal", engine: "eden", kind: m.type, ms: since(s), detail: brief(m) });
+  switch (m.type) {
+    case "error":
+      return end(s, m.error || "eden error", m.retryable === false || isFatal(m.error));
+    case "configured":
+      s.configured = true;
+      if (want && promptFor("eden") !== s.sentPrompt) syncPrompt();
+      break;
+    case "reset_applied":
+    case "prompt_applied":
+      // The new cut is anchored; give it a moment to render, then reveal it.
+      if (s.frames && want) {
+        const wid = want.id;
+        setTimeout(() => {
+          if (s !== sess || s.ended || !want || want.id !== wid) return;
+          setBusy(false);
+          showAI(true);
+          tell({ type: "showing", id: wid });
+        }, cfg.eden.revealMs);
+      }
+      break;
+  }
+}
+
+/* ---- Lucy (fal WebSocket signalling with msgpack, then WebRTC) */
 function wireSend(s, obj) {
   if (s.ws && s.ws.readyState === WebSocket.OPEN) s.ws.send(mp.encode(obj));
 }
 
-function connect() {
+function connectLucy(retried) {
   const t = useToken();
-  if (!t) { waitingForToken = true; setBusy(true); return; }
-  waitingForToken = false;
-  const s = {
-    ws: null, pc: null, live: false, ended: false,
-    hasRemote: false, pending: [], iceTimer: null, negTimer: null,
-    sentPrompt: null, t0: performance.now(), frames: false, frameTimer: null,
-  };
-  sess = s;
-  setBusy(true);
-  tell({ type: "session", state: "connecting" });
-
-  const url = "wss://fal.run/" + cfg.endpoint + "?fal_jwt_token=" + encodeURIComponent(t);
+  if (!t) { waitingForToken = { retried: !!retried }; setBusy(true); return; }
+  waitingForToken = null;
+  const s = newSession("lucy", retried);
+  const url = "wss://fal.run/" + cfg.lucy.endpoint + "?fal_jwt_token=" + encodeURIComponent(t);
   const ws = new WebSocket(url);
   ws.binaryType = "arraybuffer";
   s.ws = ws;
   ws.onopen = () => {
-    const first = { prompt: want ? want.prompt : "", enable_prompt_expansion: cfg.expandPrompt };
+    const first = { prompt: promptFor("lucy") || "", enable_prompt_expansion: cfg.expandPrompt };
     s.sentPrompt = first.prompt;
     wireSend(s, first);
-    tell({ type: "session", state: "socket-open", ms: Math.round(performance.now() - s.t0) });
+    tell({ type: "session", engine: "lucy", state: "socket-open", ms: since(s) });
   };
   ws.onmessage = (ev) => {
     let m;
     try { m = typeof ev.data === "string" ? JSON.parse(ev.data) : mp.decode(ev.data); }
     catch (e) { return tell({ type: "warn", what: "decode", error: String(e) }); }
-    onSignal(s, m).catch((e) => end(s, "signal: " + (e && e.message || e)));
+    onLucySignal(s, m).catch((e) => end(s, "signal: " + ((e && e.message) || e)));
   };
   ws.onerror = () => end(s, "socket error");
   ws.onclose = (ev) => { if (!s.ended) end(s, "socket closed " + ev.code + (ev.reason ? " " + ev.reason : "")); };
-  s.negTimer = setTimeout(() => { if (!s.hasRemote) end(s, "no answer in time"); }, cfg.negotiationMs);
+  s.timers.push(setTimeout(() => { if (!s.hasRemote) end(s, "no answer in time"); }, cfg.negotiationMs));
 }
 
-async function onSignal(s, m) {
+async function onLucySignal(s, m) {
   if (s.ended || !m || typeof m !== "object") return;
   const type = String(m.type || "").toLowerCase();
-  if (type !== "icecandidate") tell({ type: "signal", kind: type || m.status || "?", ms: Math.round(performance.now() - s.t0), detail: brief(m) });
+  if (type !== "icecandidate") tell({ type: "signal", engine: "lucy", kind: type || m.status || "?", ms: since(s), detail: brief(m) });
 
   if (m.status === "error" || type === "x-fal-error") {
     if (m.error === "TIMEOUT") return;
@@ -333,12 +460,12 @@ async function onSignal(s, m) {
   switch (type) {
     case "ready": {
       const ice = m.iceServers || m.ice_servers || m.iceservers;
-      if (ice) await startPeer(s, ice);
-      else s.iceTimer = setTimeout(() => startPeer(s, null).catch((e) => end(s, String(e))), 1000);
+      if (ice) await startLucyPeer(s, ice);
+      else s.timers.push(setTimeout(() => startLucyPeer(s, null).catch((e) => end(s, String(e))), 1000));
       break;
     }
     case "iceservers": {
-      if (!s.pc) await startPeer(s, m.iceServers || m.ice_servers || m.iceservers);
+      if (!s.pc) await startLucyPeer(s, m.iceServers || m.ice_servers || m.iceservers);
       break;
     }
     case "answer": {
@@ -346,11 +473,8 @@ async function onSignal(s, m) {
       s.hasRemote = true;
       await s.pc.setRemoteDescription({ type: "answer", sdp: m.sdp });
       for (const c of s.pending.splice(0)) await s.pc.addIceCandidate(c).catch(() => {});
-      clearTimeout(s.negTimer);
       s.live = true;
-      // Connected but no picture (e.g. a network that blocks WebRTC): give up, use the photo.
-      s.frameTimer = setTimeout(() => { if (!s.frames) end(s, "no video from Lucy", true); }, 15000);
-      tell({ type: "session", state: "negotiated", ms: Math.round(performance.now() - s.t0) });
+      tell({ type: "session", engine: "lucy", state: "negotiated", ms: since(s) });
       syncPrompt();
       break;
     }
@@ -368,9 +492,42 @@ async function onSignal(s, m) {
   }
 }
 
-// Errors a retry can't fix: send the app straight to its fallback.
+async function startLucyPeer(s, iceServers) {
+  if (s.pc || s.ended) return;
+  const stream = await openCamera();
+  if (s.ended) return;
+  const pc = new RTCPeerConnection({
+    iceServers: (iceServers && iceServers.length) ? iceServers : [{ urls: "stun:stun.l.google.com:19302" }],
+  });
+  s.pc = pc;
+  for (const track of stream.getVideoTracks()) pc.addTrack(track, stream);
+  pc.ontrack = (ev) => {
+    if (s.ended) return;
+    ai.srcObject = ev.streams && ev.streams[0] ? ev.streams[0] : new MediaStream([ev.track]);
+    ai.play().catch(() => {});
+    watchFrames(s);
+  };
+  pc.onicecandidate = (ev) => {
+    if (!ev.candidate) return;
+    wireSend(s, {
+      type: "icecandidate",
+      candidate: { candidate: ev.candidate.candidate, sdpMid: ev.candidate.sdpMid, sdpMLineIndex: ev.candidate.sdpMLineIndex },
+    });
+  };
+  pc.onconnectionstatechange = () => {
+    tell({ type: "session", engine: "lucy", state: "peer-" + pc.connectionState, ms: since(s) });
+    if (pc.connectionState === "failed") end(s, "peer connection failed");
+  };
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  wireSend(s, { type: "offer", sdp: offer.sdp });
+}
+
+/* ---- shared */
+
+// Errors a retry can't fix: skip this engine for a while.
 function isFatal(why) {
-  return /limit|unauthori[sz]ed|forbidden|balance|locked|not found|quota|credit/i.test(String(why));
+  return /limit|unauthori[sz]ed|forbidden|balance|locked|not found|quota|credit|capacity/i.test(String(why || ""));
 }
 
 function brief(m) {
@@ -384,52 +541,16 @@ function brief(m) {
   return o;
 }
 
-async function startPeer(s, iceServers) {
-  if (s.pc || s.ended) return;
-  clearTimeout(s.iceTimer);
-  const stream = await openCamera();
-  if (s.ended) return;
-  const pc = new RTCPeerConnection({
-    iceServers: (iceServers && iceServers.length) ? iceServers : [{ urls: "stun:stun.l.google.com:19302" }],
-  });
-  s.pc = pc;
-  for (const track of stream.getVideoTracks()) pc.addTrack(track, stream);
-  pc.ontrack = (ev) => {
-    if (s.ended) return;
-    const rs = ev.streams && ev.streams[0] ? ev.streams[0] : new MediaStream([ev.track]);
-    ai.srcObject = rs;
-    ai.play().catch(() => {});
-    watchFrames(s);
-  };
-  pc.onicecandidate = (ev) => {
-    if (!ev.candidate) return;
-    wireSend(s, {
-      type: "icecandidate",
-      candidate: { candidate: ev.candidate.candidate, sdpMid: ev.candidate.sdpMid, sdpMLineIndex: ev.candidate.sdpMLineIndex },
-    });
-  };
-  pc.onconnectionstatechange = () => {
-    tell({ type: "session", state: "peer-" + pc.connectionState, ms: Math.round(performance.now() - s.t0) });
-    if (pc.connectionState === "failed") end(s, "peer connection failed");
-  };
-  const offer = await pc.createOffer();
-  await pc.setLocalDescription(offer);
-  wireSend(s, { type: "offer", sdp: offer.sdp });
-}
-
 function watchFrames(s) {
   const onFrame = () => {
-    if (s.ended || s !== sess) return;
-    if (!s.frames) {
-      s.frames = true;
-      tell({ type: "session", state: "frames", ms: Math.round(performance.now() - s.t0), width: ai.videoWidth, height: ai.videoHeight });
-    }
-    // Give Lucy a beat to apply the cut before revealing it.
+    if (s.ended || s !== sess || s.frames) return;
+    s.frames = true;
+    tell({ type: "session", engine: s.engine, state: "frames", ms: since(s), width: ai.videoWidth, height: ai.videoHeight });
+    // Give the model a beat to settle on the cut before revealing it.
     setTimeout(() => {
       if (s.ended || s !== sess) return;
       setBusy(false);
       showAI(!!want);
-      retried = false;
       if (want) tell({ type: "showing", id: want.id });
     }, 350);
   };
@@ -437,21 +558,41 @@ function watchFrames(s) {
   else ai.addEventListener("playing", onFrame, { once: true });
 }
 
+// The wanted cut, worded for an engine.
+function promptFor(engine) {
+  return want ? (want.prompts[engine] || want.prompts.eden || want.prompts.lucy || null) : null;
+}
+
+// Send the wanted cut to the open session.
 function syncPrompt() {
   const s = sess;
-  if (!s || !s.live || !want) return;
-  if (s.sentPrompt === want.prompt) return;
-  s.sentPrompt = want.prompt;
-  wireSend(s, { prompt: want.prompt });
-  tell({ type: "session", state: "prompt", id: want.id });
+  if (!s || s.ended || !want) return;
+  const prompt = promptFor(s.engine);
+  if (s.sentPrompt === prompt) return;
+  if (s.engine === "eden") {
+    if (!s.configured) return;               // sent once Eden says "configured"
+    s.sentPrompt = prompt;
+    // Re-anchor on the newest camera frame wearing the new cut.
+    s.handle.send({ type: "reset", prompt });
+  } else {
+    if (!s.live) return;
+    s.sentPrompt = prompt;
+    wireSend(s, { prompt });
+  }
+  tell({ type: "session", engine: s.engine, state: "prompt", id: want.id });
 }
 
 function end(s, reason, fatal) {
   if (!s || s.ended) return;
   s.ended = true;
-  clearTimeout(s.negTimer); clearTimeout(s.iceTimer); clearTimeout(s.frameTimer);
-  try { s.pc && s.pc.close(); } catch (_) {}
-  try { if (s.ws && s.ws.readyState <= 1) s.ws.close(1000); } catch (_) {}
+  s.timers.forEach(clearTimeout);
+  if (s.engine === "eden") {
+    try { s.handle && s.handle.send({ type: "stop" }); } catch (_) {}
+    try { s.handle && s.handle.close(); } catch (_) {}
+  } else {
+    try { s.pc && s.pc.close(); } catch (_) {}
+    try { if (s.ws && s.ws.readyState <= 1) s.ws.close(1000); } catch (_) {}
+  }
   const wasCurrent = s === sess;
   if (wasCurrent) {
     sess = null;
@@ -459,15 +600,15 @@ function end(s, reason, fatal) {
     setBusy(false);
     ai.srcObject = null;
   }
-  tell({ type: "session", state: "ended", reason: reason || "done", ms: Math.round(performance.now() - s.t0) });
-  if (!wasCurrent || !reason) return;
-  // One quiet retry for a dropped connection; otherwise give up and go back to real hair.
-  if (want && !fatal && !retried) {
-    retried = true;
-    return connect();
-  }
-  retried = false;
-  if (want) { tell({ type: "failed", id: want.id, reason, fatal: !!fatal }); want = null; }
+  tell({ type: "session", engine: s.engine, state: "ended", reason: reason || "done", fatal: !!fatal, ms: since(s) });
+  if (!wasCurrent || !reason || !want) return;
+  if (fatal) blockedUntil[s.engine] = Date.now() + cfg.blockMs;
+  // One quiet retry on the same engine for a dropped connection, then the next engine.
+  if (!fatal && !s.retried) return connect(s.engine, true);
+  const next = pickEngine(s.engine);
+  if (next) return connect(next);
+  tell({ type: "failed", id: want.id, reason, fatal: !!fatal });
+  want = null;
 }
 
 function hangUp() {
@@ -495,7 +636,7 @@ window.mane = {
 
   setToken(t) {
     token = t; tokenAt = performance.now();
-    if (waitingForToken && want) connect();
+    if (waitingForToken && want) connectLucy(waitingForToken.retried);
   },
 
   // prompt === null -> back to your real hair
@@ -506,30 +647,37 @@ window.mane = {
       showAI(false);
       cls("still", false);
       setBusy(false);
-      waitingForToken = false;
+      waitingForToken = null;
       idleTimer = setTimeout(hangUp, cfg.idleCloseMs);
       return;
     }
-    want = { id, prompt };
+    // prompt: one string, or { eden, lucy } with a prompt written for each engine.
+    want = { id, prompts: typeof prompt === "string" ? { eden: prompt, lucy: prompt } : prompt };
     quietTimer = setTimeout(() => {
       tell({ type: "timeout", id: want && want.id });
       window.mane.apply(null, null);
     }, cfg.maxQuietMs);
-    retried = false;
-    if (sess && sess.live) {
-      syncPrompt();
-      if (sess.frames) {
-        showAI(true);
-        // Lucy morphs to the new cut within about a second.
-        const s = sess, wid = id;
-        setTimeout(() => {
-          if (s === sess && !s.ended && want && want.id === wid) tell({ type: "showing", id: wid });
-        }, 900);
+    const s = sess;
+    if (s && !s.ended) {
+      if (s.sentPrompt === promptFor(s.engine)) {   // back to the cut that's already running
+        if (s.frames) { setBusy(false); showAI(true); tell({ type: "showing", id }); }
+        return;
       }
-    } else if (!sess) {
+      syncPrompt();
+      if (s.frames) {
+        setBusy(true);                         // the sheen shows while the new cut lands
+        if (s.engine === "lucy") {
+          showAI(true);
+          // Lucy morphs to the new cut within about a second.
+          setTimeout(() => {
+            if (s === sess && !s.ended && want && want.id === id) { setBusy(false); tell({ type: "showing", id }); }
+          }, 900);
+        }
+      }
+    } else if (!waitingForToken) {
       connect();
     }
-    // (connecting: the latest want is sent as soon as the session is negotiated)
+    // (connecting: the latest want is sent as soon as the session can take it)
   },
 
   hold(on) { cls("hold", on); },
@@ -551,10 +699,13 @@ window.mane = {
     document.documentElement.classList.toggle("native", !!on);
   },
 
-  // Called when the app couldn't get a session token.
+  // Called when the app couldn't get a Lucy token.
   tokenFailed(reason) {
     if (!waitingForToken) return;
-    waitingForToken = false;
+    waitingForToken = null;
+    blockedUntil.lucy = Date.now() + cfg.blockMs;
+    const next = pickEngine("lucy");
+    if (want && next) return connect(next);
     setBusy(false);
     if (want) { tell({ type: "failed", id: want.id, reason: reason || "token", fatal: true }); want = null; }
   },
@@ -592,7 +743,8 @@ window.mane = {
 
   state() {
     return {
-      camera: !!camStream, want, live: !!(sess && sess.live), frames: !!(sess && sess.frames),
+      camera: !!camStream, want, engine: sess ? sess.engine : null,
+      live: !!(sess && sess.live), frames: !!(sess && sess.frames),
       showingAI: document.body.classList.contains("ai"), busy: document.body.classList.contains("busy"),
       showingStill: document.body.classList.contains("still"),
     };
