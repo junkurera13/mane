@@ -332,6 +332,7 @@ function newSession(engine, attempt, warm) {
     ws: null, pc: null, hasRemote: false, pending: [],
     // Eden
     handle: null, configured: false, configureSent: false, lastError: null,
+    appliedKey: null, pendingKey: null,   // Eden: the cut on screen / the cut asked for
   };
   sess = s;
   setBusy(!warm);
@@ -397,7 +398,7 @@ function sentKey(engine) {
 function configureEden(s) {
   if (s.configureSent || !want) return;
   s.configureSent = true;
-  s.sentPrompt = sentKey("eden");
+  s.sentPrompt = s.pendingKey = sentKey("eden");
   startFrameClock(s);
   if (!s.frames) setBusy(true);
   const anchor = want.prompts.anchor;              // optional: a frame of you already wearing the cut
@@ -414,25 +415,43 @@ function onEdenData(s, raw) {
   if (m.type !== "pong") tell({ type: "signal", engine: "eden", kind: m.type, ms: since(s), detail: brief(m) });
   switch (m.type) {
     case "error":
+      if (/already configured/i.test(m.error || "")) {
+        // The server set itself up first; switch to our cut with a reset instead.
+        s.configured = s.configureSent = true;
+        s.sentPrompt = null;
+        return syncPrompt();
+      }
       return end(s, m.error || "eden error", m.retryable === false || isFatal(m.error));
     case "configured":
       s.configured = true;
+      if (s.configureSent) {
+        s.appliedKey = s.pendingKey;
+      } else {
+        // A warm session configures itself with a generic look; it isn't a cut to show.
+        s.configureSent = true;
+        s.appliedKey = "auto";
+      }
       if (want && sentKey("eden") !== s.sentPrompt) syncPrompt();
+      else revealEden(s);
       break;
     case "reset_applied":
     case "prompt_applied":
-      // The new cut is anchored; give it a moment to render, then reveal it.
-      if (s.frames && want) {
-        const wid = want.id;
-        setTimeout(() => {
-          if (s !== sess || s.ended || !want || want.id !== wid) return;
-          setBusy(false);
-          showAI(true);
-          tell({ type: "showing", id: wid });
-        }, cfg.eden.revealMs);
-      }
+      s.appliedKey = s.pendingKey;
+      revealEden(s);
       break;
   }
+}
+
+// Show Eden's video once it's rendering the cut that's wanted.
+function revealEden(s) {
+  if (!s.frames || !want || s.appliedKey !== sentKey("eden")) return;
+  const wid = want.id;
+  setTimeout(() => {
+    if (s !== sess || s.ended || !want || want.id !== wid || s.appliedKey !== sentKey("eden")) return;
+    setBusy(false);
+    showAI(true);
+    tell({ type: "showing", id: wid });
+  }, cfg.eden.revealMs);
 }
 
 /* ---- Lucy (fal WebSocket signalling with msgpack, then WebRTC) */
@@ -572,6 +591,7 @@ function watchFrames(s) {
     if (s.ended || s !== sess || s.frames) return;
     s.frames = true;
     tell({ type: "session", engine: s.engine, state: "frames", ms: since(s), width: ai.videoWidth, height: ai.videoHeight });
+    if (s.engine === "eden") return revealEden(s);   // only once our cut is applied
     // Give the model a beat to settle on the cut before revealing it.
     setTimeout(() => {
       if (s.ended || s !== sess) return;
@@ -599,7 +619,7 @@ function syncPrompt() {
   if (s.engine === "eden") {
     if (!s.configureSent) return configureEden(s);   // a warm session's first cut
     if (!s.configured) return;               // sent once Eden says "configured"
-    s.sentPrompt = key;
+    s.sentPrompt = s.pendingKey = key;
     // Re-anchor: on the given frame of you wearing the cut, or else on the newest camera
     // frame (Eden makes that one itself).
     s.handle.send({ type: "reset", prompt, image_url: want.prompts.anchor || null });
@@ -701,6 +721,7 @@ window.mane = {
     const s = sess;
     if (s && !s.ended) {
       if (s.sentPrompt === sentKey(s.engine)) {     // back to the cut that's already running
+        if (s.engine === "eden") { setBusy(true); revealEden(s); return; }
         if (s.frames) { setBusy(false); showAI(true); tell({ type: "showing", id }); }
         return;
       }
