@@ -16,7 +16,7 @@ camera, and the wolf cut is the photo-fallback result).*
 
 ## Install
 
-1. Download **Mane.dmg** from the [`mane-latest` release](https://github.com/junkurera13/jun-work/releases/tag/mane-latest).
+1. Download **Mane.dmg** from the [`mane-latest` release](https://github.com/junkurera13/mane/releases/tag/mane-latest).
 2. Open it and drag **Mane** into **Applications**.
 3. The first time only: **right-click Mane → Open → Open**. (It isn't signed with a paid Apple
    developer account, so macOS asks once.) If macOS still refuses, go to

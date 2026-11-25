@@ -1,0 +1,169 @@
+# Builds the Mane Mac app on a GitHub Mac and publishes it as the "mane-latest" release.
+name: Mane (Mac app)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      live:
+        description: "Also run a real live session with a test face (uses the FAL_KEY secret, a few cents)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mane-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tools
+        run: sw_vers; xcodebuild -version; swift --version
+
+      - name: Build the app
+        run: VERSION="0.1.${{ github.run_number }}" BUILD="${{ github.run_number }}" scripts/bundle.sh
+
+      - name: Draw the UI (no camera on this machine)
+        run: |
+          build/Mane.app/Contents/MacOS/Mane --render build/previews \
+            --face tools/fixtures/face.jpg --thumbs tools/fixtures/thumbs
+
+      - name: Run the real app in demo mode and screenshot it
+        continue-on-error: true
+        run: |
+          shot() {
+            name=$1; shift
+            build/Mane.app/Contents/MacOS/Mane "$@" > "build/$name.log" 2>&1 &
+            PID=$!
+            sleep 7
+            screencapture -x "build/previews/screen-$name.png" || echo "screencapture failed"
+            kill $PID || true
+            sleep 1
+          }
+          shot open --demo tools/fixtures/face.jpg
+          shot making --demo tools/fixtures/face.jpg --demo-style wolf
+          shot wolf --demo tools/fixtures/face.jpg --demo-style wolf --demo-still tools/fixtures/wolf.jpg
+          shot typing --demo tools/fixtures/face.jpg --demo-typing
+          tail -n 30 build/open.log build/making.log build/wolf.log build/typing.log
+
+      - name: Probe WebKit (camera, WebRTC, sockets) inside the real app
+        continue-on-error: true
+        run: |
+          (build/Mane.app/Contents/MacOS/Mane --probe > build/probe.log 2>&1 &) ; sleep 25
+          cat build/probe.log; pkill -x Mane || true
+          grep PROBE build/probe.log > build/previews/probe.txt || echo "no probe output" > build/previews/probe.txt
+
+      - name: Pack previews
+        run: cd build && zip -qr previews.zip previews && ls -la previews
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Mane
+          path: |
+            build/Mane.dmg
+            build/Mane.zip
+            build/previews.zip
+
+      - name: Publish the "mane-latest" release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete mane-latest --yes --cleanup-tag || true
+          gh release create mane-latest build/Mane.dmg build/Mane.zip build/previews.zip \
+            --target "$GITHUB_SHA" --prerelease \
+            --title "Mane — latest build" \
+            --notes "Built from $GITHUB_SHA on ${GITHUB_REF_NAME}. Download Mane.dmg, drag Mane to Applications, then right-click → Open the first time."
+
+  # Real live sessions on a test face, on a machine with open internet (WebRTC needs it).
+  # The fal key comes from the FAL_KEY secret if there is one; otherwise this machine makes a
+  # one-time RSA key pair, publishes the public half, and waits for the fal key encrypted to it
+  # (committed as .live/<run id>.enc). The private half never leaves this machine, which is
+  # destroyed after the run, so the encrypted file can never be opened again.
+  live-test:
+    if: (github.event_name == 'workflow_dispatch' && inputs.live) || contains(github.event.head_commit.message, '[live]')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get the fal key
+        id: key
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SECRET_KEY: ${{ secrets.FAL_KEY }}
+        run: |
+          K="$RUNNER_TEMP/k"; mkdir -p "$K"; chmod 700 "$K"
+          if [ -n "$SECRET_KEY" ]; then
+            printf %s "$SECRET_KEY" > "$K/fal"
+          else
+            openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$K/priv.pem" 2>/dev/null
+            openssl pkey -in "$K/priv.pem" -pubout -out "$K/pub.pem"
+            gh release create "mane-live-key-$GITHUB_RUN_ID" "$K/pub.pem" --target "$GITHUB_SHA" --prerelease \
+              --title "One-time public key for live test $GITHUB_RUN_ID" \
+              --notes "The private half exists only on the machine running this test."
+            echo "Waiting for .live/$GITHUB_RUN_ID.enc on $GITHUB_REF_NAME ..."
+            for i in $(seq 1 90); do
+              git fetch -q origin "$GITHUB_REF_NAME" || true
+              if git show "FETCH_HEAD:.live/$GITHUB_RUN_ID.enc" > "$K/enc.b64" 2>/dev/null; then break; fi
+              sleep 10
+            done
+            base64 -d "$K/enc.b64" > "$K/enc.bin"
+            openssl pkeyutl -decrypt -inkey "$K/priv.pem" -pkeyopt rsa_padding_mode:oaep \
+              -pkeyopt rsa_oaep_md:sha256 -in "$K/enc.bin" -out "$K/fal"
+            rm -f "$K/priv.pem" "$K/enc.bin"
+            gh release delete "mane-live-key-$GITHUB_RUN_ID" --yes --cleanup-tag || true
+          fi
+          echo "::add-mask::$(cat "$K/fal")"
+          if [ -s "$K/fal" ]; then echo "have=yes" >> "$GITHUB_OUTPUT"; else echo "No fal key."; fi
+
+      - uses: actions/setup-node@v4
+        if: steps.key.outputs.have == 'yes'
+        with:
+          node-version: 22
+
+      - name: Install Playwright + Chromium
+        if: steps.key.outputs.have == 'yes'
+        run: npm i -g playwright@1.56 && npx -y playwright@1.56 install --with-deps chromium
+
+      - name: Make a fake camera from the test face
+        if: steps.key.outputs.have == 'yes'
+        run: |
+          command -v ffmpeg >/dev/null || (sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg >/dev/null)
+          mkdir -p build
+          ffmpeg -loglevel error -y -loop 1 -i tools/fixtures/face.jpg -filter_complex \
+            "[0]scale=1280:1280,crop=1280:704:0:0,boxblur=20[bg];[0]scale=704:704[fg];[bg][fg]overlay=x='(W-w)/2+14*sin(2*PI*t/3)':y=0:eval=frame,format=yuvj420p" \
+            -t 9 -r 24 -q:v 3 -f mjpeg build/face.mjpeg
+
+      - name: Live sessions, exactly as the app does them (Eden 5B + Nano Banana anchors)
+        if: steps.key.outputs.have == 'yes'
+        run: |
+          export FAL_KEY="$(cat "$RUNNER_TEMP/k/fal")"
+          export NODE_PATH="$(npm root -g)"
+          mkdir -p build/live/app-flow
+          timeout 600 node tools/try-live.mjs --app-flow --engines eden --video build/face.mjpeg --out build/live/app-flow \
+            --seconds 6 --record \
+            --style "buzz=a very short buzz cut, clipped evenly close to the scalp" \
+            --style "wolf=a shaggy wolf cut: choppy layered shag with volume on top, wispy curtain bangs and longer layers at the neck" \
+            --style "blonde=bleached platinum blonde hair, keeping the current haircut, length and shape" \
+            --style "long=long, flowing, layered hair falling well past the shoulders" \
+            > build/live/app-flow/run.log 2>&1 || true
+          grep -v '"icecandidate"' build/live/app-flow/run.log | grep -v '"phase":"ice' | cut -c1-260 | tail -60
+
+      - name: Publish the frames ("mane-live-test" release)
+        if: steps.key.outputs.have == 'yes'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          rm -f "$RUNNER_TEMP/k/fal"
+          cd build && zip -qr live-test.zip live && ls -laR live | head -60
+          gh release delete mane-live-test --yes --cleanup-tag || true
+          gh release create mane-live-test live-test.zip --target "$GITHUB_SHA" --prerelease \
+            --title "Mane — live test frames" --notes "Frames and screen recordings from real live sessions on a test face."
