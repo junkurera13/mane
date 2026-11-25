@@ -15,6 +15,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
+        installEditMenu()
+
         let engine = MirrorEngine()
         let notch = NotchController(engine: engine)
         self.notch = notch
@@ -59,4 +61,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { KeyWindow.show() }
         }
     }
+}
+
+/// An accessory app has no menu bar of its own, and AppKit routes ⌘V/⌘C/⌘X/⌘A to text fields
+/// only through Edit-menu key equivalents. This menu is never shown; it just makes paste work
+/// (e.g. pasting the fal.ai key).
+@MainActor
+private func installEditMenu() {
+    let main = NSMenu()
+    let editItem = NSMenuItem()
+    let edit = NSMenu(title: "Edit")
+    edit.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
+    edit.addItem(withTitle: "Redo", action: Selector(("redo:")), keyEquivalent: "Z")
+    edit.addItem(.separator())
+    edit.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+    edit.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+    edit.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+    edit.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+    editItem.submenu = edit
+    main.addItem(editItem)
+    NSApp.mainMenu = main
 }
