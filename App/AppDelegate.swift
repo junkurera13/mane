@@ -22,6 +22,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.notch = notch
         status = StatusItemController(notch: notch)
         engine.onNeedsKey = { KeyWindow.show() }
+        KeyWindow.onSaved = { [weak notch] in notch?.open() }
 
         HotKey.register { [weak notch] in notch?.toggle() }
 

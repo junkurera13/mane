@@ -54,6 +54,8 @@ final class StatusItemController: NSObject {
 @MainActor
 enum KeyWindow {
     private static var window: NSWindow?
+    /// Called after Save when a key is set (the app opens the mirror, so Save visibly does something).
+    static var onSaved: (() -> Void)?
 
     static func show() {
         if window == nil {
@@ -63,7 +65,12 @@ enum KeyWindow {
             w.titlebarAppearsTransparent = true
             w.titleVisibility = .hidden
             w.isReleasedWhenClosed = false
-            w.contentView = NSHostingView(rootView: KeyView { w.close() })
+            w.contentView = NSHostingView(rootView: KeyView {
+                w.close()
+                if KeyStore.key != nil {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { KeyWindow.onSaved?() }
+                }
+            })
             w.center()
             window = w
         }
